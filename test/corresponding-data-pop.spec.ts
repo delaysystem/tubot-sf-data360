@@ -134,8 +134,13 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
   let mockD1: { db: D1Database; tables: Map<string, Map<string, any>> };
   let env: Data360Env;
   let conversationState: UserConversationHistory;
+  let originalFetch: typeof fetch;
 
   beforeEach(async () => {
+    originalFetch = globalThis.fetch;
+    // Explicit-token userinfo validation and B2 lookups fail fast and
+    // deterministically, exercising the same fallback paths as live failures.
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response("{}", { status: 401 }));
     mockD1 = createMockD1();
 
     // Initial conversation state for Session 1 with 1 message
@@ -185,15 +190,20 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
     clearAllMemoryCaches(mockD1.db);
   });
 
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
   describe("Phase 1: Multi-Turn Conversation Simulation", () => {
     it("Turn 1 (Initial contact): fetches all 3 components on cache MISS and saves them to D1", async () => {
       const req = new Request(
-        `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}&channelId=${channelId}&sessionId=${session1Id}`,
+        `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}&channelId=${channelId}&sessionId=${session1Id}&orgId=${orgId}`,
         {
           method: "GET",
           headers: {
             "x-salesforce-access-token": "test-token",
             "x-salesforce-instance-url": "https://test.my.salesforce.com",
+            "x-team-id": "team-123",
           },
         }
       );
@@ -272,12 +282,13 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
 
       // Conversation cache was not yet populated or was invalidated for new message
       const req = new Request(
-        `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}&channelId=${channelId}&sessionId=${session1Id}`,
+        `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}&channelId=${channelId}&sessionId=${session1Id}&orgId=${orgId}`,
         {
           method: "GET",
           headers: {
             "x-salesforce-access-token": "test-token",
             "x-salesforce-instance-url": "https://test.my.salesforce.com",
+            "x-team-id": "team-123",
           },
         }
       );
@@ -329,11 +340,13 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
         `https://tubot-sf-data360.internal/api/data360/corresponding-data`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "x-team-id": "team-123" },
           body: JSON.stringify({
             userId,
             channelId,
             sessionId: session2Id,
+            teamId: "team-123",
+            orgId,
           }),
         }
       );

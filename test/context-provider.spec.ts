@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import worker, {
   TubotSfData360Entrypoint,
   D1Data360Cache,
@@ -73,8 +73,20 @@ function createMockD1(): { db: D1Database; tables: Map<string, Map<string, any>>
 describe("tubot-sf-data360 Context Provider & Smart Caching", () => {
   let mockEnv: Data360Env;
   let mockD1: { db: D1Database; tables: Map<string, Map<string, any>> };
+  let originalFetch: typeof fetch;
 
   beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      const urlStr = String(url);
+      if (urlStr.includes("b2_authorize_account")) {
+        return new Response("{}", { status: 401 });
+      }
+      if (urlStr.includes("/composite/batch")) {
+        return Response.json({ hasErrors: false, results: [] });
+      }
+      return Response.json({ records: [] });
+    });
     mockD1 = createMockD1();
     mockEnv = {
       DB: mockD1.db,
@@ -84,6 +96,7 @@ describe("tubot-sf-data360 Context Provider & Smart Caching", () => {
             accessToken: "mock-token-xyz",
             instanceUrl: "https://testorg.my.salesforce.com",
             orgId: "00D800000000001AAA",
+            teamId: "team-1",
           };
         },
         async getCallableToolUrlsForChannel(channelId: string) {
@@ -142,11 +155,17 @@ describe("tubot-sf-data360 Context Provider & Smart Caching", () => {
     };
   });
 
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
   it("assembleContext returns all 5 non-negotiable requirements for tubot-agentcode", async () => {
     const options: GetContextOptions = {
       userId: "user-123",
       channelId: "channel-abc",
       agentName: "ServiceAgent",
+      teamId: "team-1",
+      orgId: "00D800000000001AAA",
       agentScript: `system_prompt: "Service agent"\ntopic agent_router {}`,
     };
 
@@ -183,6 +202,8 @@ describe("tubot-sf-data360 Context Provider & Smart Caching", () => {
     const options: GetContextOptions = {
       userId: "user-123",
       channelId: "channel-abc",
+      teamId: "team-1",
+      orgId: "00D800000000001AAA",
     };
 
     // First call: Cache MISS for both

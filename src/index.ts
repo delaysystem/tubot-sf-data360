@@ -1,7 +1,11 @@
 import type {
+  Context,
+  ContextMessage,
+  ContextResult,
   Data360Env,
   ExportData360Options,
   ExtractedData360Package,
+  GetContextOptions,
   UserData360Result,
   MessagingSessionData360Result,
   CorrespondingDataOptions,
@@ -487,7 +491,9 @@ export function createB2CacheManager(env: Data360Env): B2CacheManager {
     keyId: env.BACKBLAZE_KEY_ID || "",
     applicationKey: env.BACKBLAZE_APPLICATION_KEY || "",
     bucketId: env.BACKBLAZE_BUCKET_ID || "",
+    bucketName: env.BACKBLAZE_BUCKET_NAME || "",
     endpoint: env.BACKBLAZE_ENDPOINT || "",
+    pathPrefix: env.DATA360_PATH_PREFIX || "data360",
   });
 }
 
@@ -935,6 +941,24 @@ function getContentTypeForFile(filename: string): string {
     default: return "application/octet-stream";
   }
 }
+
+/**
+ * Constant-time secret comparison for the /cache/refresh gate.
+ * Returns false on length mismatch without revealing which bytes differ.
+ */
+function timingSafeEqual(provided: string, expected: string): boolean {
+  const a = new TextEncoder().encode(provided);
+  const b = new TextEncoder().encode(expected);
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
+}
+
+/** Max age for the /cache/refresh recency short-circuit (6 hours). */
+const REFRESH_RECENCY_WINDOW_MS = 6 * 60 * 60 * 1000;
 
 function parseHeadersForAuth(request: Request, options: ExportData360Options): ExportData360Options {
   const authHeader = request.headers.get("authorization");
@@ -1750,6 +1774,24 @@ export default {
 
     // Export & Refresh Endpoints
     if (path === "/export" || path === "/api/export" || path === "/cache/refresh" || path === "/api/cache/refresh") {
+      const isRefresh = path === "/cache/refresh" || path === "/api/cache/refresh";
+
+      // Internal gate: ONLY /cache/refresh requires the shared data360 secret.
+      // /export behavior is unchanged.
+      if (isRefresh) {
+        if (request.method !== "POST") {
+          return Response.json({ error: "method_not_allowed" }, { status: 405 });
+        }
+        const expectedSecret = env.DATA360_INTERNAL_KEY;
+        if (!expectedSecret) {
+          return Response.json({ error: "data360_unconfigured" }, { status: 503 });
+        }
+        const providedSecret = request.headers.get("x-data360-secret");
+        if (!providedSecret || !timingSafeEqual(providedSecret, expectedSecret)) {
+          return Response.json({ error: "unauthorized" }, { status: 401 });
+        }
+      }
+
       try {
         let options: ExportData360Options = {};
 
@@ -1783,9 +1825,13 @@ export default {
           options.cacheTtlSeconds = parseInt(cacheTtlParam, 10);
         }
 
-        // If called via /cache/refresh, always enforce cacheToB2
-        if (path === "/cache/refresh" || path === "/api/cache/refresh") {
+        // If called via /cache/refresh, always enforce cacheToB2 and skip
+        // unstructured file bytes. Per-file downloads (plus their redirect hops)
+        // exhaust the per-invocation subrequest budget before the B2 save runs;
+        // refresh snapshots carry records+metadata, file bytes stay in /export.
+        if (isRefresh) {
           options.cacheToB2 = true;
+          options.includeUnstructuredFiles = false;
         }
 
         parseHeadersForAuth(request, options);
@@ -1800,6 +1846,53 @@ export default {
           );
         }
 
+        // Recency short-circuit: skip re-extraction when the latest tenant-scoped
+        // snapshot is fresh (<=6h old). Any lookup failure falls through to extraction.
+        if (isRefresh) {
+          const refreshTargetId = (options.channelId || options.agentName || "").trim();
+          const refreshOrgId = options.orgId || refreshTargetId;
+          if (refreshTargetId && refreshOrgId) {
+            try {
+              const recencyCacheMgr = createB2CacheManager(env);
+              const latest = await recencyCacheMgr.getLatestSnapshot(refreshOrgId, refreshTargetId);
+              const latestTs = latest ? Date.parse(latest.timestamp || "") : NaN;
+              if (latest && !Number.isNaN(latestTs) && Date.now() - latestTs <= REFRESH_RECENCY_WINDOW_MS) {
+                const dedupedCache = latest.manifest?.b2Cache ?? {
+                  stored: true,
+                  bucketName: "",
+                  bucketId: "",
+                  snapshotId: latest.snapshotId,
+                  basePath: `${recencyCacheMgr.rootPrefix()}/${refreshOrgId}/${refreshTargetId}/snapshots/${latest.snapshotId}`,
+                  cachedAt: latest.timestamp,
+                  bandwidthAlliance: true,
+                  totalBytes: latest.totalBytes,
+                  fileCount: latest.fileCount,
+                };
+                return Response.json(
+                  {
+                    ok: true,
+                    deduped: true,
+                    message: "Cache is fresh; skipped re-extraction.",
+                    cache: dedupedCache,
+                    manifest: latest.manifest,
+                  },
+                  {
+                    status: 200,
+                    headers: {
+                      "Content-Type": "application/json",
+                      "X-Bz-Info-Bandwidth-Alliance": "true",
+                      "X-B2-Cache-Path": dedupedCache.basePath,
+                      "X-B2-Snapshot-Id": dedupedCache.snapshotId,
+                    },
+                  }
+                );
+              }
+            } catch {
+              // Fall through to full extraction on any cache lookup failure.
+            }
+          }
+        }
+
         // 1. Resolve Salesforce credentials / token via tubot-sf-auth bridge
         const authBridge = new SalesforceAuthBridge(env);
         const authResult = await authBridge.resolveToken(options);
@@ -1810,7 +1903,7 @@ export default {
         const pkg = await extractor.extractData360(authResult.connection, options);
 
         // If called via /cache/refresh, return confirmation and cache metadata
-        if (path === "/cache/refresh" || path === "/api/cache/refresh") {
+        if (isRefresh) {
           return Response.json(
             {
               ok: true,

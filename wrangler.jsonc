@@ -10,10 +10,15 @@
     "enabled": true
   },
   "upload_source_maps": true,
+  "vars": {
+    "BACKBLAZE_BUCKET_NAME": "tubot-encrypted",
+    "DATA360_PATH_PREFIX": "data360"
+  },
   "services": [
     {
       "binding": "TUBOT_SF_AUTH",
-      "service": "tubot-sf-auth-staging"
+      "service": "tubot-sf-auth-staging",
+      "entrypoint": "TubotSfAuthEntrypoint"
     },
     {
       "binding": "TUBOT_SF_PARSER",
@@ -26,5 +31,32 @@
       "database_name": "agent-dashboard-db-staging",
       "database_id": "8f100c42-cb9a-44aa-b995-391f942edf10"
     }
-  ]
+  ],
+  "env": {
+    "production": {
+      "name": "tubot-sf-data360-production",
+      "vars": {
+        "BACKBLAZE_BUCKET_NAME": "tubot-encrypted",
+        "DATA360_PATH_PREFIX": "data360-prod"
+      },
+      "services": [
+        {
+          "binding": "TUBOT_SF_AUTH",
+          "service": "tubot-sf-auth",
+          "entrypoint": "TubotSfAuthEntrypoint"
+        },
+        {
+          "binding": "TUBOT_SF_PARSER",
+          "service": "tubot-sf-parser"
+        }
+      ],
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "agent-dashboard-db-production",
+          "database_id": "0334422a-b534-4322-be11-9e195947b348"
+        }
+      ]
+    }
+  }
 }

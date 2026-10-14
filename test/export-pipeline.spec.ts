@@ -137,6 +137,7 @@ describe("tubot-sf-data360 export pipeline", () => {
           accessToken: "mock-test-token",
           instanceUrl: "https://test.my.salesforce.com",
           orgId: "00D000000000001AAA",
+          teamId: "team-1",
         }),
       },
     };
@@ -147,6 +148,8 @@ describe("tubot-sf-data360 export pipeline", () => {
       body: JSON.stringify({
         channelId: "0Mjg5000000VtMnCAK",
         agentName: "DATA360TEST",
+        teamId: "team-1",
+        orgId: "00D000000000001AAA",
       }),
     });
 
@@ -189,6 +192,8 @@ describe("tubot-sf-data360 export pipeline", () => {
         getTokenForChannel: vi.fn().mockResolvedValue({
           accessToken: "mock-test-token",
           instanceUrl: "https://test.my.salesforce.com",
+          orgId: "00D000000000001AAA",
+          teamId: "team-1",
         }),
       },
     };
@@ -199,6 +204,8 @@ describe("tubot-sf-data360 export pipeline", () => {
       body: JSON.stringify({
         agentName: "DATA360TEST",
         format: "json",
+        teamId: "team-1",
+        orgId: "00D000000000001AAA",
       }),
     });
 
@@ -276,6 +283,7 @@ describe("tubot-sf-data360 export pipeline", () => {
           accessToken: "mock-test-token",
           instanceUrl: "https://test.my.salesforce.com",
           orgId: "00D000000000001AAA",
+          teamId: "team-1",
         }),
       },
     };
@@ -287,6 +295,8 @@ describe("tubot-sf-data360 export pipeline", () => {
         agentName: "DATA360TEST",
         format: "json",
         cacheToB2: true,
+        teamId: "team-1",
+        orgId: "00D000000000001AAA",
       }),
     });
 
@@ -340,6 +350,7 @@ describe("tubot-sf-data360 export pipeline", () => {
     });
 
     const env: Data360Env = {
+      DATA360_INTERNAL_KEY: "test-internal-secret",
       BACKBLAZE_KEY_ID: "test-key-id",
       BACKBLAZE_APPLICATION_KEY: "test-app-key",
       BACKBLAZE_BUCKET_ID: "tubot-encrypted",
@@ -349,15 +360,18 @@ describe("tubot-sf-data360 export pipeline", () => {
           accessToken: "mock-test-token",
           instanceUrl: "https://test.my.salesforce.com",
           orgId: "00D000000000001AAA",
+          teamId: "team-1",
         }),
       },
     };
 
     const req = new Request("https://data360.internal/cache/refresh", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-data360-secret": "test-internal-secret" },
       body: JSON.stringify({
         agentName: "DATA360TEST",
+        teamId: "team-1",
+        orgId: "00D000000000001AAA",
       }),
     });
 

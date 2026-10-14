@@ -99,6 +99,17 @@ export class B2Client implements B2ClientInterface {
     this.authToken = data.authorizationToken;
     this.apiUrl = data.apiUrl;
     this.downloadUrl = data.downloadUrl;
+    // Downloads address the bucket by NAME (/file/<name>/...), so an id-shaped
+    // configured name breaks every read. Adopt the authoritative name from the
+    // authorize response unless an explicit (non-id) name was configured.
+    const derivedName = data?.allowed?.bucketName || data?.apiInfo?.storageApi?.bucketName;
+    if (
+      typeof derivedName === "string" &&
+      derivedName &&
+      (!this.bucketName || /^[0-9a-f]{24}$/i.test(this.bucketName))
+    ) {
+      this.bucketName = derivedName;
+    }
 
     return {
       apiUrl: data.apiUrl,
@@ -248,6 +259,26 @@ const CRM_ENTITY_MAP: Record<string, string> = {
   messagingSessions: "MessagingSession",
 };
 
+/** Version tag for the data-bundle.json snapshot layout (see savePackage). */
+const DATA_BUNDLE_VERSION = 1;
+
+/** Portable base64 encode/decode (Workers have no Buffer). */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
 /**
  * Extracts target identifier (channelId, agentName, or fallback)
  */
@@ -330,6 +361,12 @@ export class B2CacheManager {
 
   get client(): B2ClientInterface {
     return this.b2Client;
+  }
+
+  /** B2 key root for this manager (sanitized; default "data360"). */
+  rootPrefix(): string {
+    const raw = this.config?.pathPrefix || "data360";
+    return /^[A-Za-z0-9_-]{1,64}$/.test(raw) ? raw : "data360";
   }
 
   private async doUpload(
@@ -448,7 +485,7 @@ export class B2CacheManager {
     const snapshotId =
       options?.snapshotId || new Date().toISOString().replace(/[:.]/g, "-");
 
-    const basePath = `data360/${orgId}/${targetIdentifier}/snapshots/${snapshotId}`;
+    const basePath = `${this.rootPrefix()}/${orgId}/${targetIdentifier}/snapshots/${snapshotId}`;
     let totalBytes = 0;
     let fileCount = 0;
 
@@ -475,99 +512,33 @@ export class B2CacheManager {
       await upload("data360-export.zip", pkg.zipBytes, "application/zip");
     }
 
-    // 2. Upload metadata JSONs
-    if (pkg.metadata) {
-      if (pkg.metadata.marketSegments !== undefined) {
-        await uploadJson("metadata/segments.json", pkg.metadata.marketSegments);
-      }
-      if (pkg.metadata.dataSpaces !== undefined) {
-        await uploadJson("metadata/data-spaces.json", pkg.metadata.dataSpaces);
-      }
-      if (pkg.metadata.calculatedInsights !== undefined) {
-        await uploadJson("metadata/calculated-insights.json", pkg.metadata.calculatedInsights);
-      }
-      if (pkg.metadata.identityResolutionRules !== undefined) {
-        await uploadJson("metadata/identity-resolution.json", pkg.metadata.identityResolutionRules);
-      }
-      if (pkg.metadata.channel) {
-        await uploadJson("metadata/channel.json", pkg.metadata.channel);
-      }
-      if (pkg.metadata.dataStreams && pkg.metadata.dataStreams.length > 0) {
-        await uploadJson("metadata/data-streams.json", pkg.metadata.dataStreams);
-      }
-      if (pkg.metadata.dataLakeMappings && pkg.metadata.dataLakeMappings.length > 0) {
-        await uploadJson("metadata/data-lake-mappings.json", pkg.metadata.dataLakeMappings);
-      }
-      if (
-        pkg.metadata.unstructuredSearchIndexes &&
-        pkg.metadata.unstructuredSearchIndexes.length > 0
-      ) {
-        await uploadJson("metadata/search-indexes.json", pkg.metadata.unstructuredSearchIndexes);
-      }
-      if (pkg.metadata.dmoDescribes) {
-        for (const [dmoName, describeObj] of Object.entries(pkg.metadata.dmoDescribes)) {
-          const cleanDmoName = dmoName.endsWith(".json") ? dmoName : `${dmoName}.json`;
-          await uploadJson(`metadata/dmos/${cleanDmoName}`, describeObj);
-        }
-      }
-    }
-
-    // 3. Upload agent metadata if present
-    if (pkg.agent) {
-      if (pkg.agent.callableTools && pkg.agent.callableTools.length > 0) {
-        await uploadJson("metadata/callable-tools.json", pkg.agent.callableTools);
-      }
-      if (pkg.agent.localActions && Object.keys(pkg.agent.localActions).length > 0) {
-        await uploadJson("metadata/local-actions.json", pkg.agent.localActions);
-      }
-    }
-
-    // 4. Upload CRM records (data/crm/Individual.json, etc.)
-    if (pkg.records?.crm) {
-      for (const [key, value] of Object.entries(pkg.records.crm)) {
-        if (value !== undefined) {
-          const mappedName = CRM_ENTITY_MAP[key] || key;
-          const fileName = mappedName.endsWith(".json") ? mappedName : `${mappedName}.json`;
-          await uploadJson(`data/crm/${fileName}`, value);
-        }
-      }
-    }
-
-    // 5. Upload Data Cloud DMO records (data/data-cloud/*.json)
-    if (pkg.records?.dataCloud) {
-      for (const [dmoName, records] of Object.entries(pkg.records.dataCloud)) {
-        if (records !== undefined) {
-          const fileName = dmoName.endsWith(".json") ? dmoName : `${dmoName}.json`;
-          await uploadJson(`data/data-cloud/${fileName}`, records);
-        }
-      }
-    }
-
-    // 6. Upload unstructured files if present (files/...)
-    if (pkg.unstructuredFiles && pkg.unstructuredFiles.length > 0) {
-      const fileManifest = [];
-      for (const file of pkg.unstructuredFiles) {
-        const fileBytes =
-          file.data instanceof Uint8Array ? file.data : new Uint8Array(file.data);
-        await upload(
-          `files/${file.filename}`,
-          fileBytes,
-          file.contentType || "application/octet-stream"
-        );
-        fileManifest.push({
-          id: file.id,
-          sourceObject: file.sourceObject,
-          title: file.title,
-          filename: file.filename,
-          category: file.category,
-          fileType: file.fileType,
-          contentType: file.contentType,
-          contentSize: file.contentSize ?? fileBytes.length,
-          path: `files/${file.filename}`,
-        });
-      }
-      await uploadJson("metadata/files-manifest.json", fileManifest);
-    }
+    // 2. Upload ONE data-bundle.json with every queryable record, metadata entry,
+    // and unstructured file (base64). One exploded file per entity costs 2 B2
+    // subrequests each and blows the per-invocation subrequest budget; the bundle
+    // keeps a full snapshot save to 4 uploads (zip, bundle, manifest, latest).
+    // Readers still fall back to the legacy exploded layout when no bundle exists.
+    const bundleFiles = (pkg.unstructuredFiles || []).map((file) => {
+      const fileBytes = file.data instanceof Uint8Array ? file.data : new Uint8Array(file.data as any);
+      return {
+        id: file.id,
+        sourceObject: file.sourceObject,
+        title: file.title,
+        filename: file.filename,
+        category: file.category,
+        fileType: file.fileType,
+        contentType: file.contentType,
+        contentSize: file.contentSize ?? fileBytes.length,
+        path: `files/${file.filename}`,
+        dataBase64: bytesToBase64(fileBytes),
+      };
+    });
+    await uploadJson("data-bundle.json", {
+      version: DATA_BUNDLE_VERSION,
+      metadata: pkg.metadata,
+      agent: pkg.agent,
+      records: pkg.records,
+      files: bundleFiles,
+    });
 
     // 7. Prepare and upload manifest.json
     const bucketName =
@@ -629,7 +600,7 @@ export class B2CacheManager {
       zipSizeBytes: pkg.zipBytes?.length || 0,
     };
 
-    const latestPath = `data360/${orgId}/${targetIdentifier}/latest.json`;
+    const latestPath = `${this.rootPrefix()}/${orgId}/${targetIdentifier}/latest.json`;
     await this.doUpload(
       latestPath,
       JSON.stringify(summary, null, 2),
@@ -644,7 +615,7 @@ export class B2CacheManager {
    */
   async getLatestSnapshot(orgId: string, targetId: string): Promise<B2SnapshotSummary | null> {
     const cleanTargetId = targetId.trim().replace(/[/\\]/g, "_");
-    const key = `data360/${orgId}/${cleanTargetId}/latest.json`;
+    const key = `${this.rootPrefix()}/${orgId}/${cleanTargetId}/latest.json`;
     const data = await this.doDownload(key);
     if (!data) return null;
 
@@ -657,10 +628,27 @@ export class B2CacheManager {
   }
 
   /**
+   * Reads the data-bundle.json snapshot layout (see savePackage). Returns null
+   * when the snapshot predates bundles so callers fall back to exploded paths.
+   */
+  private async readDataBundle(snapshotPrefix: string): Promise<any | null> {
+    const bytes = await this.doDownload(`${snapshotPrefix}/data-bundle.json`);
+    if (!bytes) return null;
+    try {
+      const text = typeof bytes === "string" ? bytes : new TextDecoder().decode(bytes);
+      const bundle = JSON.parse(text);
+      return bundle && bundle.version === DATA_BUNDLE_VERSION ? bundle : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Queries a cached entity from a snapshot.
-   * If query.dmo: downloads data/data-cloud/${query.dmo}.json
-   * If query.crmEntity: downloads data/crm/${query.crmEntity}.json
-   * If query.file: downloads files/${query.file} (returns binary bytes or text)
+   * Bundle-first (data-bundle.json), with fallback to the legacy exploded layout:
+   * If query.dmo: data/data-cloud/${query.dmo}.json
+   * If query.crmEntity: data/crm/${query.crmEntity}.json
+   * If query.file: files/${query.file} (returns binary bytes or text)
    * If no entity specified: returns full snapshot manifest.
    */
   async queryCachedEntity(
@@ -679,11 +667,15 @@ export class B2CacheManager {
       snapshotId = latest.snapshotId;
     }
 
-    const snapshotPrefix = `data360/${orgId}/${cleanTargetId}/snapshots/${snapshotId}`;
+    const snapshotPrefix = `${this.rootPrefix()}/${orgId}/${cleanTargetId}/snapshots/${snapshotId}`;
+    const bundle = await this.readDataBundle(snapshotPrefix);
 
     // 1. Data Cloud DMO query
     if (query.dmo) {
-      const dmoFile = query.dmo.endsWith(".json") ? query.dmo : `${query.dmo}.json`;
+      const dmoName = query.dmo.endsWith(".json") ? query.dmo.slice(0, -5) : query.dmo;
+      const bundled = bundle?.records?.dataCloud?.[dmoName];
+      if (bundled !== undefined) return bundled;
+      const dmoFile = `${dmoName}.json`;
       const key = `${snapshotPrefix}/data/data-cloud/${dmoFile}`;
       const bytes = await this.doDownload(key);
       if (!bytes) return null;
@@ -693,6 +685,14 @@ export class B2CacheManager {
 
     // 2. CRM Entity query
     if (query.crmEntity) {
+      const entityName = query.crmEntity.endsWith(".json")
+        ? query.crmEntity.slice(0, -5)
+        : query.crmEntity;
+      const bundleKey =
+        Object.entries(CRM_ENTITY_MAP).find(([, mapped]) => mapped === entityName)?.[0] ||
+        entityName;
+      const bundled = bundle?.records?.crm?.[bundleKey];
+      if (bundled !== undefined) return bundled;
       const mapped = CRM_ENTITY_MAP[query.crmEntity] || query.crmEntity;
       const crmFile = mapped.endsWith(".json") ? mapped : `${mapped}.json`;
       let bytes = await this.doDownload(`${snapshotPrefix}/data/crm/${crmFile}`);
@@ -712,14 +712,24 @@ export class B2CacheManager {
     // 3. Unstructured file query
     if (query.file) {
       const cleanFile = query.file.replace(/^files\//, "");
-      let key = `${snapshotPrefix}/files/${cleanFile}`;
-      let bytes = await this.doDownload(key);
+      const bundledFile = (bundle?.files || []).find(
+        (f: any) =>
+          f?.filename === cleanFile ||
+          (cleanFile.includes("/") && f?.filename === cleanFile.split("/").pop())
+      );
+      let bytes: Uint8Array | string | null = bundledFile?.dataBase64
+        ? base64ToBytes(bundledFile.dataBase64)
+        : null;
+      if (!bytes) {
+        let key = `${snapshotPrefix}/files/${cleanFile}`;
+        bytes = await this.doDownload(key);
 
-      if (!bytes && cleanFile.includes("/")) {
-        const basename = cleanFile.split("/").pop();
-        if (basename) {
-          key = `${snapshotPrefix}/files/${basename}`;
-          bytes = await this.doDownload(key);
+        if (!bytes && cleanFile.includes("/")) {
+          const basename = cleanFile.split("/").pop();
+          if (basename) {
+            key = `${snapshotPrefix}/files/${basename}`;
+            bytes = await this.doDownload(key);
+          }
         }
       }
 
@@ -781,7 +791,7 @@ export class B2CacheManager {
       resolvedSnapshotId = latest.snapshotId;
     }
 
-    const key = `data360/${orgId}/${cleanTargetId}/snapshots/${resolvedSnapshotId}/data360-export.zip`;
+    const key = `${this.rootPrefix()}/${orgId}/${cleanTargetId}/snapshots/${resolvedSnapshotId}/data360-export.zip`;
     const data = await this.doDownload(key);
     if (!data) return null;
 
@@ -796,7 +806,7 @@ export class B2CacheManager {
    */
   async listSnapshots(orgId: string, targetId: string): Promise<B2SnapshotSummary[]> {
     const cleanTargetId = targetId.trim().replace(/[/\\]/g, "_");
-    const prefix = `data360/${orgId}/${cleanTargetId}/snapshots/`;
+    const prefix = `${this.rootPrefix()}/${orgId}/${cleanTargetId}/snapshots/`;
     const result = await this.doListFiles(prefix);
 
     const rawFiles: any[] = Array.isArray(result)
@@ -874,7 +884,7 @@ export class B2CacheManager {
    */
   async saveUserData(orgId: string, userId: string, data: any): Promise<string> {
     const cleanUserId = userId.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const filePath = `data360/${orgId}/users/${cleanUserId}/data360.json`;
+    const filePath = `${this.rootPrefix()}/${orgId}/users/${cleanUserId}/data360.json`;
     const jsonStr = typeof data === "string" ? data : JSON.stringify(data, null, 2);
     await this.doUpload(filePath, jsonStr, "application/json");
     return filePath;
@@ -885,7 +895,7 @@ export class B2CacheManager {
    */
   async saveSessionData(orgId: string, sessionId: string, data: any): Promise<string> {
     const cleanSessionId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const filePath = `data360/${orgId}/sessions/${cleanSessionId}/data360.json`;
+    const filePath = `${this.rootPrefix()}/${orgId}/sessions/${cleanSessionId}/data360.json`;
     const jsonStr = typeof data === "string" ? data : JSON.stringify(data, null, 2);
     await this.doUpload(filePath, jsonStr, "application/json");
     return filePath;

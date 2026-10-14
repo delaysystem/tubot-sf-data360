@@ -17,12 +17,15 @@ export interface Data360Env {
     fetch?(input: any, init?: any): Promise<Response>;
   };
   DB?: D1Database;
+  DATA360_INTERNAL_KEY?: string;
   SF_CREDENTIAL_ENCRYPTION_KEY?: string;
   PARSER_SERVICE_URL?: string;
   BACKBLAZE_APPLICATION_KEY?: string;
   BACKBLAZE_KEY_ID?: string;
   BACKBLAZE_BUCKET_ID?: string;
+  BACKBLAZE_BUCKET_NAME?: string;
   BACKBLAZE_ENDPOINT?: string;
+  DATA360_PATH_PREFIX?: string;
   CACHE_TO_B2_BY_DEFAULT?: string;
 }
 
@@ -299,6 +302,8 @@ export interface B2Config {
   bucketId: string;
   bucketName?: string;
   endpoint?: string;
+  /** B2 key root isolating environments sharing one bucket (default "data360"). */
+  pathPrefix?: string;
 }
 
 export interface B2CacheMetadata {

@@ -227,43 +227,32 @@ describe("B2CacheManager", () => {
         "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data360-export.zip"
       );
 
-      // 4. Metadata JSONs
+      // 4. Single data-bundle.json replaces the exploded per-entity layout
+      // (one exploded file per entity costs 2 B2 subrequests each and exceeds
+      // the per-invocation subrequest budget on small plans).
       expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/metadata/segments.json"
+        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data-bundle.json"
       );
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/metadata/data-spaces.json"
+      const bundleRaw = mockClient.files.get(
+        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data-bundle.json"
       );
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/metadata/dmos/UnifiedIndividual__dlm.json"
-      );
+      const bundle = JSON.parse(new TextDecoder().decode(bundleRaw!.data));
+      expect(bundle.version).toBe(1);
+      expect(bundle.records.crm.individuals[0].FirstName).toBe("John");
+      expect(bundle.records.dataCloud["UnifiedIndividual__dlm"][0].firstName__c).toBe("John");
+      expect(bundle.metadata.marketSegments).toBeDefined();
+      expect(bundle.files.map((f: any) => f.filename).sort()).toEqual([
+        "firmware.bin",
+        "policy.txt",
+      ]);
 
-      // 5. CRM records
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data/crm/Individual.json"
-      );
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data/crm/ContactPointEmail.json"
-      );
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data/crm/Order.json"
-      );
-
-      // 6. Data Cloud DMO records
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data/data-cloud/UnifiedIndividual__dlm.json"
-      );
-
-      // 7. Unstructured files
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/files/policy.txt"
-      );
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/files/firmware.bin"
-      );
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/metadata/files-manifest.json"
-      );
+      // 5. No exploded per-entity uploads (subrequest budget)
+      for (const key of uploadedKeys) {
+        expect(key).not.toMatch(/\/metadata\/(segments|data-spaces|dmos|files-manifest)/);
+        expect(key).not.toMatch(/\/data\/(crm|data-cloud)\//);
+        expect(key).not.toMatch(/\/files\//);
+      }
+      expect(uploadedKeys).toHaveLength(4); // zip, bundle, manifest, latest
     });
 
     it("handles package without zipBytes or unstructured files", async () => {
@@ -327,6 +316,85 @@ describe("B2CacheManager", () => {
       expect(uploadedKeys).not.toContain(
         "data360/org-custom/BillingAgent/snapshots/snap-billing-1/data360-export.zip"
       );
+    });
+  });
+
+  describe("B2Client bucket name resolution", () => {
+    it("adopts the authorize-derived bucket name when configured with an id", async () => {
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = (async () =>
+        Response.json({
+          authorizationToken: "tok",
+          apiUrl: "https://api.backblazeb2.com",
+          downloadUrl: "https://f.backblazeb2.com",
+          allowed: { bucketId: "60b9667d033bd7359af6011e", bucketName: "tubot-encrypted" },
+        })) as any;
+      try {
+        const client = new B2Client({
+          keyId: "k",
+          applicationKey: "a",
+          bucketId: "60b9667d033bd7359af6011e",
+        });
+        expect(client.bucketName).toBe("60b9667d033bd7359af6011e");
+        await client.authorize();
+        expect(client.bucketName).toBe("tubot-encrypted");
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it("keeps an explicitly configured bucket name", async () => {
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = (async () =>
+        Response.json({
+          authorizationToken: "tok",
+          apiUrl: "https://api.backblazeb2.com",
+          downloadUrl: "https://f.backblazeb2.com",
+          allowed: { bucketId: "60b9667d033bd7359af6011e", bucketName: "other-name" },
+        })) as any;
+      try {
+        const client = new B2Client({
+          keyId: "k",
+          applicationKey: "a",
+          bucketId: "60b9667d033bd7359af6011e",
+          bucketName: "explicit-name",
+        });
+        await client.authorize();
+        expect(client.bucketName).toBe("explicit-name");
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+  });
+
+  describe("pathPrefix environment isolation", () => {
+    it("scopes every key under the configured prefix and rejects hostile values", async () => {
+      const prefixed = new B2CacheManager(mockClient, {
+        keyId: "k",
+        applicationKey: "a",
+        bucketId: "b",
+        pathPrefix: "data360-prod",
+      });
+      expect(prefixed.rootPrefix()).toBe("data360-prod");
+      const meta = await prefixed.savePackage(samplePkg, { snapshotId: "snap-1" });
+      expect(meta.basePath).toBe("data360-prod/acme-corp/0Mj000000000001/snapshots/snap-1");
+      const keys = Array.from(mockClient.files.keys());
+      expect(keys).toContain("data360-prod/acme-corp/0Mj000000000001/latest.json");
+      expect(keys.every((k) => k.startsWith("data360-prod/"))).toBe(true);
+      const latest = await prefixed.getLatestSnapshot("acme-corp", "0Mj000000000001");
+      expect(latest?.snapshotId).toBe("snap-1");
+      const dmo = await prefixed.queryCachedEntity("acme-corp", "0Mj000000000001", {
+        dmo: "UnifiedIndividual__dlm",
+      });
+      expect(dmo[0].firstName__c).toBe("John");
+
+      const hostile = new B2CacheManager(mockClient, {
+        keyId: "k",
+        applicationKey: "a",
+        bucketId: "b",
+        pathPrefix: "../../evil",
+      });
+      expect(hostile.rootPrefix()).toBe("data360");
     });
   });
 
@@ -452,6 +520,38 @@ describe("B2CacheManager", () => {
 
       expect(recordsFromOlderSnapshot[0].FirstName).toBe("John");
       expect(recordsFromNewerSnapshot[0].FirstName).toBe("Bob");
+    });
+
+    it("falls back to the legacy exploded layout when no bundle exists", async () => {
+      const prefix = "data360/acme-corp/0Mj000000000001/snapshots/snap-legacy";
+      const enc = new TextEncoder();
+      mockClient.files.set(`${prefix}/data/data-cloud/UnifiedIndividual__dlm.json`, {
+        data: enc.encode(JSON.stringify([{ firstName__c: "Legacy" }])),
+      });
+      mockClient.files.set(`${prefix}/data/crm/Individual.json`, {
+        data: enc.encode(JSON.stringify([{ FirstName: "Legacy" }])),
+      });
+      mockClient.files.set(`${prefix}/files/note.txt`, {
+        data: enc.encode("legacy bytes"),
+      });
+
+      const dmo = await cacheManager.queryCachedEntity("acme-corp", "0Mj000000000001", {
+        dmo: "UnifiedIndividual__dlm",
+        snapshotId: "snap-legacy",
+      });
+      expect(dmo[0].firstName__c).toBe("Legacy");
+
+      const crm = await cacheManager.queryCachedEntity("acme-corp", "0Mj000000000001", {
+        crmEntity: "Individual",
+        snapshotId: "snap-legacy",
+      });
+      expect(crm[0].FirstName).toBe("Legacy");
+
+      const file = await cacheManager.queryCachedEntity("acme-corp", "0Mj000000000001", {
+        file: "note.txt",
+        snapshotId: "snap-legacy",
+      });
+      expect(file).toBe("legacy bytes");
     });
 
     it("returns null for non-existent entities", async () => {
