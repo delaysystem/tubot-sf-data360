@@ -327,15 +327,15 @@ describe("B2CacheManager", () => {
           authorizationToken: "tok",
           apiUrl: "https://api.backblazeb2.com",
           downloadUrl: "https://f.backblazeb2.com",
-          allowed: { bucketId: "60b9667d033bd7359af6011e", bucketName: "tubot-encrypted" },
+          allowed: { bucketId: "f00df00df00df00df00df00d", bucketName: "tubot-encrypted" },
         })) as any;
       try {
         const client = new B2Client({
           keyId: "k",
           applicationKey: "a",
-          bucketId: "60b9667d033bd7359af6011e",
+          bucketId: "f00df00df00df00df00df00d",
         });
-        expect(client.bucketName).toBe("60b9667d033bd7359af6011e");
+        expect(client.bucketName).toBe("f00df00df00df00df00df00d");
         await client.authorize();
         expect(client.bucketName).toBe("tubot-encrypted");
       } finally {
@@ -350,13 +350,13 @@ describe("B2CacheManager", () => {
           authorizationToken: "tok",
           apiUrl: "https://api.backblazeb2.com",
           downloadUrl: "https://f.backblazeb2.com",
-          allowed: { bucketId: "60b9667d033bd7359af6011e", bucketName: "other-name" },
+          allowed: { bucketId: "f00df00df00df00df00df00d", bucketName: "other-name" },
         })) as any;
       try {
         const client = new B2Client({
           keyId: "k",
           applicationKey: "a",
-          bucketId: "60b9667d033bd7359af6011e",
+          bucketId: "f00df00df00df00df00df00d",
           bucketName: "explicit-name",
         });
         await client.authorize();
