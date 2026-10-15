@@ -1,4 +1,5 @@
 import { DATA_CLOUD_FAMILIES, type DataCloudFamily, type DataCloudObject, type SalesforceConnection } from "./types";
+import { CACHE_TTL, cacheGetJSON, cachePutJSON, catalogCacheKey, lastGoodCacheKey } from "./cache";
 
 type Row = Record<string, any>;
 export const sqlIdentifier = (value: string): string => {
@@ -17,6 +18,31 @@ export class DataCloudBudgetExhaustedError extends Error {
 
 /** Caps Data 360 row retrieval so a full export fits the Workers 50-subrequest invocation limit. */
 export const DATA_CLOUD_RETRIEVE_SUBREQUEST_BUDGET = 16;
+
+/**
+ * Catalog metadata keys retained after discovery. Per-object `fields` arrays
+ * and every other key are dropped: full metadata is megabytes and is
+ * re-serialized on every export, while the worker only reads these keys
+ * (classification markers plus Data Graph lookup inputs). `dgObject` is kept
+ * whole because its nested fields carry the Data Graph primary lookup keys.
+ */
+const SLIM_METADATA_KEYS = [
+  "apiName", "developerName", "name", "dataSpaceName", "dataspaceName", "dataSpace",
+  "label", "isEnabled", "isUnstructured", "isLink", "isUnified", "category",
+  "creationType", "definitionType", "dgObject", "primaryObjectName", "valuesDmoName",
+] as const;
+
+const slimMetadata = (metadata: Row): Row => {
+  const slim: Row = {};
+  for (const key of SLIM_METADATA_KEYS) {
+    if (metadata[key] !== undefined) slim[key] = metadata[key];
+  }
+  return slim;
+};
+
+export interface DataCloudDiscoverOptions {
+  includeObjectSchemas?: boolean;
+}
 
 export class DataCloudClient {
   private readonly root: string;
@@ -74,9 +100,39 @@ export class DataCloudClient {
     return rows;
   }
 
-  async discover(onCatalog?: (family: string, count: number) => void): Promise<{ dataSpaces: Row[]; objects: DataCloudObject[]; identityResolutions: Row[]; warnings: string[] }> {
+  async discover(
+    onCatalog?: ((family: string, count: number) => void) | DataCloudDiscoverOptions,
+    opts?: DataCloudDiscoverOptions,
+  ): Promise<{ dataSpaces: Row[]; objects: DataCloudObject[]; identityResolutions: Row[]; warnings: string[] }> {
+    const callback = typeof onCatalog === "function" ? onCatalog : undefined;
+    const includeObjectSchemas =
+      (typeof onCatalog === "object" && onCatalog !== null ? onCatalog.includeObjectSchemas : undefined)
+      ?? opts?.includeObjectSchemas ?? false;
+    const orgId = this.connection.orgId;
+    // Full-schema discovery bypasses the slim catalog cache so the cached
+    // payload stays small and opt-in callers always see complete schemas.
+    if (orgId && !includeObjectSchemas) {
+      const cached = await cacheGetJSON<{ dataSpaces: Row[]; objects: DataCloudObject[]; identityResolutions: Row[] }>(catalogCacheKey(orgId));
+      if (cached && Array.isArray(cached.dataSpaces) && Array.isArray(cached.objects) && Array.isArray(cached.identityResolutions)) {
+        return { dataSpaces: cached.dataSpaces, objects: cached.objects, identityResolutions: cached.identityResolutions, warnings: [] };
+      }
+    }
+    const result = await this.discoverLive(callback, includeObjectSchemas);
+    if (orgId && !includeObjectSchemas) {
+      await cachePutJSON(catalogCacheKey(orgId), {
+        dataSpaces: result.dataSpaces, objects: result.objects, identityResolutions: result.identityResolutions,
+      }, CACHE_TTL.catalog);
+    }
+    return result;
+  }
+
+  private async discoverLive(
+    onCatalog: ((family: string, count: number) => void) | undefined,
+    includeObjectSchemas: boolean,
+  ): Promise<{ dataSpaces: Row[]; objects: DataCloudObject[]; identityResolutions: Row[]; warnings: string[] }> {
     const dataSpaces = await this.list("data-spaces", "dataSpaces");
     const objects: DataCloudObject[] = [];
+    const seenObjects = new Set<string>();
     const warnings: string[] = [];
     const identityResolutions: Row[] = [];
     for (const space of dataSpaces) {
@@ -114,8 +170,10 @@ export class DataCloudClient {
             }
             if (kind === "calculated-insight" && metadata.definitionType === "STREAMING_METRIC") continue; // Deferred until live streaming coverage is available.
             if (kind === "dmo" && resolvedFamilies.has(objectName)) family = resolvedFamilies.get(objectName)!;
-            if (!objects.some(o => o.name === objectName && o.dataSpace === dataSpace && o.family === family)) {
-              objects.push({ name: objectName, dataSpace, family, storageKey: `${dataSpace}/${objectName}`, metadata });
+            const dedupeKey = `${dataSpace}\0${objectName}\0${family}`;
+            if (!seenObjects.has(dedupeKey)) {
+              seenObjects.add(dedupeKey);
+              objects.push({ name: objectName, dataSpace, family, storageKey: `${dataSpace}/${objectName}`, metadata: includeObjectSchemas ? metadata : slimMetadata(metadata) });
             }
           }
           onCatalog?.(kind, objects.filter(o => o.dataSpace === name && o.family === kind).length);
@@ -125,8 +183,10 @@ export class DataCloudClient {
         }
       }
     }
+    const nameCounts = new Map<string, number>();
+    for (const object of objects) nameCounts.set(object.name, (nameCounts.get(object.name) ?? 0) + 1);
     for (const object of objects) {
-      if (objects.filter(o => o.name === object.name).length === 1) object.storageKey = object.name;
+      if (nameCounts.get(object.name) === 1) object.storageKey = object.name;
     }
     return { dataSpaces, objects, identityResolutions, warnings };
   }
@@ -159,7 +219,7 @@ export class DataCloudClient {
     });
   }
 
-  async read(object: DataCloudObject, limit: number): Promise<Row[]> {
+  async read(object: DataCloudObject, limit: number, descriptorCache?: Map<string, Promise<any>>): Promise<Row[]> {
     const max = Math.min(5000, Math.max(1, Math.trunc(limit)));
     if (object.family !== "data-graph") return this.query(`SELECT * FROM ${sqlIdentifier(object.name)} LIMIT ${max}`, object.dataSpace, max);
     const graph = object.metadata;
@@ -182,7 +242,20 @@ export class DataCloudClient {
         return [`${primary}.${field}=${value}`];
       });
       const route = `${this.root}actions/standard/cdpGetDataGraphByLookup`;
-      const descriptor = await this.request(route);
+      let descriptor: any;
+      if (!descriptorCache) {
+        descriptor = await this.request(route);
+      } else {
+        let pending = descriptorCache.get(route);
+        if (!pending) {
+          pending = this.request(route);
+          descriptorCache.set(route, pending);
+          void pending.catch(() => {
+            if (descriptorCache.get(route) === pending) descriptorCache.delete(route);
+          });
+        }
+        descriptor = await pending;
+      }
       const inputs: Row = {};
       for (const [name, value] of [["datagraphapiname", object.name], ["dataspaceapiname", object.dataSpace], ["lookupkey", `[${values.join(",")}]`]]) {
         const field = descriptor.inputs?.find((field: Row) => String(field.name).toLowerCase() === name);
@@ -207,11 +280,16 @@ export class DataCloudClient {
     const dataGraphs: Record<string, Row[]> = {};
     const warnings: string[] = [];
     const tried = new Set<string>();
+    const descriptorCache = new Map<string, Promise<any>>();
+    const orgId = this.connection.orgId;
     const read = async (object: DataCloudObject) => {
       tried.add(object.storageKey);
       try {
-        const rows = await this.read(object, maxRecords);
+        const rows = await this.read(object, maxRecords, descriptorCache);
         (object.family === "data-graph" ? dataGraphs : dataCloud)[object.storageKey] = rows;
+        if (orgId && rows.length > 0) {
+          await cachePutJSON(lastGoodCacheKey(orgId, object.family), { storageKey: object.storageKey }, CACHE_TTL.lastGood);
+        }
         return rows.length > 0;
       } catch (error) {
         if (error instanceof DataCloudBudgetExhaustedError) throw error;
@@ -220,14 +298,28 @@ export class DataCloudClient {
         return false;
       }
     };
+    // Last-known-good hints: probe each family's previously readable object
+    // first. A miss or stale hint keeps normal scan order; correctness is unchanged.
+    const hints = new Map<string, string>();
+    if (orgId) {
+      const families = [...new Set(objects.map(o => o.family))];
+      const loaded = await Promise.all(families.map(family => cacheGetJSON<{ storageKey: string }>(lastGoodCacheKey(orgId, family))));
+      loaded.forEach((hint, index) => {
+        if (hint && typeof hint.storageKey === "string") hints.set(families[index], hint.storageKey);
+      });
+    }
     this.subrequestBudget = opts?.subrequestBudget ?? null;
     try {
       for (const object of objects.filter(o => referenced.includes(o.name))) await read(object);
       for (const family of DATA_CLOUD_FAMILIES) {
         const candidates = objects.filter(o => o.family === family && o.metadata.isEnabled !== false &&
           (family !== "dmo" || !["Adg", "Semantic"].includes(o.metadata.creationType)));
-        if (candidates.some(o => (family === "data-graph" ? dataGraphs : dataCloud)[o.storageKey]?.length)) continue;
-        for (const object of candidates) {
+        const hinted = hints.get(family);
+        const ordered = hinted
+          ? [...candidates.filter(o => o.storageKey === hinted), ...candidates.filter(o => o.storageKey !== hinted)]
+          : candidates;
+        if (ordered.some(o => (family === "data-graph" ? dataGraphs : dataCloud)[o.storageKey]?.length)) continue;
+        for (const object of ordered) {
           if (!tried.has(object.storageKey) && await read(object)) break;
         }
       }

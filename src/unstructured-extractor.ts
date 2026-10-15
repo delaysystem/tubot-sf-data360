@@ -2,6 +2,26 @@ import type { ExtractedUnstructuredFile, SalesforceConnection } from "./types";
 
 export type FileCategory = ExtractedUnstructuredFile["category"];
 
+/**
+ * Discovery SOQL used to list unstructured-file candidates. Exported so the
+ * Data 360 extractor can run them inside its shared composite batch instead
+ * of this extractor issuing standalone queries.
+ */
+export const UNSTRUCTURED_LISTING_QUERIES = {
+  contentVersion:
+    "SELECT Id, Title, FileType, FileExtension, ContentSize, ContentDocumentId, Description FROM ContentVersion WHERE IsLatest = true ORDER BY CreatedDate DESC LIMIT 50",
+  document:
+    "SELECT Id, Name, Type, ContentType, BodyLength, Description FROM Document ORDER BY CreatedDate DESC",
+  staticResource:
+    "SELECT Id, Name, ContentType, BodyLength, Description FROM StaticResource ORDER BY CreatedDate DESC",
+};
+
+export interface UnstructuredFileListings {
+  contentVersion?: any[];
+  document?: any[];
+  staticResource?: any[];
+}
+
 export interface ExtractUnstructuredOptions {
   maxFiles?: number;
   includeContentVersion?: boolean;
@@ -9,6 +29,7 @@ export interface ExtractUnstructuredOptions {
   includeStaticResource?: boolean;
   apiVersion?: string;
   concurrency?: number;
+  listings?: UnstructuredFileListings;
 }
 
 const EXTENSION_MAP: Record<string, string> = {
@@ -316,9 +337,7 @@ export class UnstructuredExtractor {
     // 1. ContentVersion (Prioritizes PDF files first in memory)
     if (includeContentVersion) {
       if (maxFiles === undefined || recordsToDownload.length < maxFiles) {
-        const cvSoql =
-          "SELECT Id, Title, FileType, FileExtension, ContentSize, ContentDocumentId, Description FROM ContentVersion WHERE IsLatest = true ORDER BY CreatedDate DESC LIMIT 50";
-        const cvRecords = await runSoql<{
+        const cvRecords: {
           Id: string;
           Title?: string;
           FileType?: string;
@@ -326,10 +345,20 @@ export class UnstructuredExtractor {
           ContentSize?: number;
           ContentDocumentId?: string;
           Description?: string;
-        }>(cvSoql);
+        }[] =
+          options?.listings?.contentVersion ??
+          (await runSoql<{
+            Id: string;
+            Title?: string;
+            FileType?: string;
+            FileExtension?: string;
+            ContentSize?: number;
+            ContentDocumentId?: string;
+            Description?: string;
+          }>(UNSTRUCTURED_LISTING_QUERIES.contentVersion));
 
-        // Sort so PDFs are processed first
-        cvRecords.sort((a, b) => {
+        // Sort so PDFs are processed first (on a copy: listings may be caller-owned)
+        const sortedCvRecords = [...cvRecords].sort((a, b) => {
           const isAPdf = (a.FileType || "").toUpperCase() === "PDF" || (a.FileExtension || "").toLowerCase() === "pdf";
           const isBPdf = (b.FileType || "").toUpperCase() === "PDF" || (b.FileExtension || "").toLowerCase() === "pdf";
           if (isAPdf && !isBPdf) return -1;
@@ -337,7 +366,7 @@ export class UnstructuredExtractor {
           return 0;
         });
 
-        for (const r of cvRecords) {
+        for (const r of sortedCvRecords) {
           if (maxFiles !== undefined && recordsToDownload.length >= maxFiles) break;
           recordsToDownload.push({
             id: r.Id,
@@ -357,16 +386,23 @@ export class UnstructuredExtractor {
     // 2. Document
     if (includeDocument) {
       if (maxFiles === undefined || recordsToDownload.length < maxFiles) {
-        const docSoql =
-          "SELECT Id, Name, Type, ContentType, BodyLength, Description FROM Document ORDER BY CreatedDate DESC";
-        const docRecords = await runSoql<{
+        const docRecords: {
           Id: string;
           Name?: string;
           Type?: string;
           ContentType?: string;
           BodyLength?: number;
           Description?: string;
-        }>(docSoql);
+        }[] =
+          options?.listings?.document ??
+          (await runSoql<{
+            Id: string;
+            Name?: string;
+            Type?: string;
+            ContentType?: string;
+            BodyLength?: number;
+            Description?: string;
+          }>(UNSTRUCTURED_LISTING_QUERIES.document));
 
         for (const r of docRecords) {
           if (maxFiles !== undefined && recordsToDownload.length >= maxFiles) break;
@@ -388,15 +424,21 @@ export class UnstructuredExtractor {
     // 3. StaticResource
     if (includeStaticResource) {
       if (maxFiles === undefined || recordsToDownload.length < maxFiles) {
-        const srSoql =
-          "SELECT Id, Name, ContentType, BodyLength, Description FROM StaticResource ORDER BY CreatedDate DESC";
-        const srRecords = await runSoql<{
+        const srRecords: {
           Id: string;
           Name?: string;
           ContentType?: string;
           BodyLength?: number;
           Description?: string;
-        }>(srSoql);
+        }[] =
+          options?.listings?.staticResource ??
+          (await runSoql<{
+            Id: string;
+            Name?: string;
+            ContentType?: string;
+            BodyLength?: number;
+            Description?: string;
+          }>(UNSTRUCTURED_LISTING_QUERIES.staticResource));
 
         for (const r of srRecords) {
           if (maxFiles !== undefined && recordsToDownload.length >= maxFiles) break;

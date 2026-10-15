@@ -3,22 +3,52 @@ import type {
   SalesforceConnection,
 } from "./types";
 import { SalesforceBatchClient } from "./batch-client";
+import { CACHE_TTL, cacheGetJSON, cachePutJSON, channelMapCacheKey } from "./cache";
+
+export interface ChannelAgentResolution {
+  agentName: string;
+  channelRecord?: any;
+  channelDeveloperName?: string;
+}
 
 export class AgentAnalyzer {
   constructor(private readonly batchClient = new SalesforceBatchClient()) {}
 
   /**
    * Resolves the agent developer name and messaging channel record from a channel ID or agent name.
+   * Read-through caches the resolution in the edge Cache API when conn.orgId is present.
    */
   async resolveChannelAndAgent(
     conn: SalesforceConnection,
     identifier: string,
     apiVersion: string = SalesforceBatchClient.DEFAULT_API_VERSION
-  ): Promise<{
-    agentName: string;
-    channelRecord?: any;
-    channelDeveloperName?: string;
-  }> {
+  ): Promise<ChannelAgentResolution> {
+    const clean = identifier.trim();
+    if (!clean) {
+      throw new Error("Target identifier cannot be empty.");
+    }
+
+    // No org scope: skip caching entirely, never cache under an unscoped key.
+    if (!conn.orgId) {
+      return this.resolveChannelAndAgentUncached(conn, identifier, apiVersion);
+    }
+
+    const key = channelMapCacheKey(conn.orgId, clean);
+    const cached = await cacheGetJSON<ChannelAgentResolution>(key);
+    if (cached && typeof cached.agentName === "string") {
+      return cached;
+    }
+
+    const resolved = await this.resolveChannelAndAgentUncached(conn, identifier, apiVersion);
+    await cachePutJSON(key, resolved, CACHE_TTL.channelMap);
+    return resolved;
+  }
+
+  private async resolveChannelAndAgentUncached(
+    conn: SalesforceConnection,
+    identifier: string,
+    apiVersion: string
+  ): Promise<ChannelAgentResolution> {
     const clean = identifier.trim();
     if (!clean) {
       throw new Error("Target identifier cannot be empty.");

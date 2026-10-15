@@ -171,6 +171,11 @@ export interface ExportData360Options {
   cacheTtlSeconds?: number;
   cacheKey?: string;
   format?: "zip" | "json";
+  /**
+   * Keep full per-object schemas (including `fields` arrays) in discovered
+   * catalog metadata. Default false keeps slim metadata so exports stay small.
+   */
+  includeObjectSchemas?: boolean;
 }
 
 export interface BatchSubrequest {

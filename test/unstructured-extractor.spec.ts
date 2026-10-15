@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   UnstructuredExtractor,
+  UNSTRUCTURED_LISTING_QUERIES,
   categorizeFile,
   sanitizeFilename,
   resolveExtension,
@@ -274,6 +275,229 @@ describe("UnstructuredExtractor", () => {
     await expect(extractor.extractAllFiles(conn)).rejects.toThrow(
       "Failed to download binary for ContentVersion 068xxError"
     );
+  });
+
+  describe("provided listings (shared composite batch discovery)", () => {
+    let originalFetch: typeof fetch;
+
+    beforeEach(() => {
+      originalFetch = globalThis.fetch;
+    });
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+    });
+
+    function discoveryUrls(fetchMock: { mock: { calls: unknown[][] } }): string[] {
+      return fetchMock.mock.calls
+        .map(([url]) => String(url))
+        .filter((url) => url.includes("/query?q="));
+    }
+
+    it("uses provided listings without running discovery SOQL", async () => {
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        const urlStr = String(url);
+        if (urlStr.includes("/sobjects/ContentVersion/068xx000001PDF/VersionData")) {
+          return new Response(mockPdfBytes, {
+            status: 200,
+            headers: { "Content-Type": "application/pdf" },
+          });
+        }
+        if (urlStr.includes("/sobjects/Document/015xx000003TXT/Body")) {
+          return new Response(mockTxtBytes, {
+            status: 200,
+            headers: { "Content-Type": "text/plain" },
+          });
+        }
+        if (urlStr.includes("/sobjects/StaticResource/081xx000004ZIP/Body")) {
+          return new Response(mockZipBytes, {
+            status: 200,
+            headers: { "Content-Type": "application/zip" },
+          });
+        }
+        return new Response("Not Found", { status: 404 });
+      });
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const extractor = new UnstructuredExtractor();
+      const files = await extractor.extractAllFiles(conn, {
+        listings: {
+          contentVersion: [
+            {
+              Id: "068xx000001PDF",
+              Title: "Quarterly Report",
+              FileType: "PDF",
+              FileExtension: "pdf",
+              ContentSize: mockPdfBytes.byteLength,
+              ContentDocumentId: "069xx000001DOC",
+              Description: "Q3 Financial Report",
+            },
+          ],
+          document: [
+            {
+              Id: "015xx000003TXT",
+              Name: "server_config",
+              Type: "txt",
+              ContentType: "text/plain",
+              BodyLength: mockTxtBytes.byteLength,
+              Description: "Server Environment Settings",
+            },
+          ],
+          staticResource: [
+            {
+              Id: "081xx000004ZIP",
+              Name: "application_assets",
+              ContentType: "application/zip",
+              BodyLength: mockZipBytes.byteLength,
+              Description: "Static Web Assets Bundle",
+            },
+          ],
+        },
+      });
+
+      expect(files).toHaveLength(3);
+      expect(files.map((f) => f.sourceObject)).toEqual([
+        "ContentVersion",
+        "Document",
+        "StaticResource",
+      ]);
+      expect(files[0].category).toBe("pdf");
+      expect(files[0].description).toBe("Q3 Financial Report");
+      expect(discoveryUrls(fetchMock)).toHaveLength(0);
+    });
+
+    it("respects maxFiles across provided listings in category order", async () => {
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        const urlStr = String(url);
+        if (urlStr.includes("/sobjects/ContentVersion/068xx000001PDF/VersionData")) {
+          return new Response(mockPdfBytes, {
+            status: 200,
+            headers: { "Content-Type": "application/pdf" },
+          });
+        }
+        if (urlStr.includes("/sobjects/Document/015xx000003TXT/Body")) {
+          return new Response(mockTxtBytes, {
+            status: 200,
+            headers: { "Content-Type": "text/plain" },
+          });
+        }
+        if (urlStr.includes("/sobjects/Document/015xx000005CSV/Body")) {
+          return new Response(mockTxtBytes, {
+            status: 200,
+            headers: { "Content-Type": "text/csv" },
+          });
+        }
+        return new Response("Not Found", { status: 404 });
+      });
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const extractor = new UnstructuredExtractor();
+      const files = await extractor.extractAllFiles(conn, {
+        maxFiles: 3,
+        listings: {
+          contentVersion: [
+            {
+              Id: "068xx000001PDF",
+              Title: "Report",
+              FileType: "PDF",
+              FileExtension: "pdf",
+              ContentSize: mockPdfBytes.byteLength,
+            },
+          ],
+          document: [
+            {
+              Id: "015xx000003TXT",
+              Name: "a_config",
+              Type: "txt",
+              ContentType: "text/plain",
+              BodyLength: mockTxtBytes.byteLength,
+            },
+            {
+              Id: "015xx000005CSV",
+              Name: "b_export",
+              Type: "csv",
+              ContentType: "text/csv",
+              BodyLength: mockTxtBytes.byteLength,
+            },
+          ],
+          staticResource: [
+            {
+              Id: "081xx000004ZIP",
+              Name: "assets",
+              ContentType: "application/zip",
+              BodyLength: mockZipBytes.byteLength,
+            },
+          ],
+        },
+      });
+
+      expect(files.map((f) => f.id)).toEqual([
+        "068xx000001PDF",
+        "015xx000003TXT",
+        "015xx000005CSV",
+      ]);
+      // StaticResource beyond maxFiles is never downloaded.
+      const fetchedUrls = fetchMock.mock.calls.map(([url]) => String(url));
+      expect(fetchedUrls.some((u) => u.includes("081xx000004ZIP"))).toBe(false);
+      expect(discoveryUrls(fetchMock)).toHaveLength(0);
+    });
+
+    it("falls back to live queries for listing categories left undefined", async () => {
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        const decodedUrl = decodeURIComponent(String(url));
+        if (decodedUrl.includes("/query?q=") && decodedUrl.includes("FROM Document")) {
+          return Response.json({ totalSize: 0, done: true, records: [] });
+        }
+        if (
+          decodedUrl.includes("/query?q=") &&
+          decodedUrl.includes("FROM StaticResource")
+        ) {
+          return Response.json({ totalSize: 0, done: true, records: [] });
+        }
+        if (String(url).includes("/sobjects/ContentVersion/068xx000001PDF/VersionData")) {
+          return new Response(mockPdfBytes, {
+            status: 200,
+            headers: { "Content-Type": "application/pdf" },
+          });
+        }
+        return new Response("Not Found", { status: 404 });
+      });
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const extractor = new UnstructuredExtractor();
+      const files = await extractor.extractAllFiles(conn, {
+        listings: {
+          contentVersion: [
+            {
+              Id: "068xx000001PDF",
+              Title: "Report",
+              FileType: "PDF",
+              FileExtension: "pdf",
+              ContentSize: mockPdfBytes.byteLength,
+            },
+          ],
+        },
+      });
+
+      expect(files).toHaveLength(1);
+      expect(files[0].id).toBe("068xx000001PDF");
+      const discovery = discoveryUrls(fetchMock).map((u) => decodeURIComponent(u));
+      expect(discovery.some((u) => u.includes("FROM ContentVersion"))).toBe(false);
+      expect(discovery.some((u) => u.includes("FROM Document"))).toBe(true);
+      expect(discovery.some((u) => u.includes("FROM StaticResource"))).toBe(true);
+    });
+
+    it("exposes the exact discovery SQL via UNSTRUCTURED_LISTING_QUERIES", () => {
+      expect(UNSTRUCTURED_LISTING_QUERIES.contentVersion).toBe(
+        "SELECT Id, Title, FileType, FileExtension, ContentSize, ContentDocumentId, Description FROM ContentVersion WHERE IsLatest = true ORDER BY CreatedDate DESC LIMIT 50"
+      );
+      expect(UNSTRUCTURED_LISTING_QUERIES.document).toBe(
+        "SELECT Id, Name, Type, ContentType, BodyLength, Description FROM Document ORDER BY CreatedDate DESC"
+      );
+      expect(UNSTRUCTURED_LISTING_QUERIES.staticResource).toBe(
+        "SELECT Id, Name, ContentType, BodyLength, Description FROM StaticResource ORDER BY CreatedDate DESC"
+      );
+    });
   });
 });
 

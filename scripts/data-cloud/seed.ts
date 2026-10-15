@@ -8,7 +8,8 @@ async function main() {
   if (!Number.isFinite(seconds) || seconds <= 0) throw Error("--timeout-seconds must be positive");
   report({ stage: "discover", target });
   if (!["all", "identity"].includes(phase)) throw Error("Supported seed phases: all, identity. Streaming Insight is deferred.");
-  const catalog = await client.discover((family, count) => report({ catalog: family, count }));
+  // Identity seeding reads per-object `fields` schemas, so it opts out of slim catalog metadata.
+  const catalog = await client.discover((family, count) => report({ catalog: family, count }), { includeObjectSchemas: true });
   const prefix = argument("--asset-prefix") ?? "Data360 verification";
   async function mutate(path: string, body: unknown) {
     const response = await fetch(`${conn.instanceUrl}/services/data/${apiVersion}/ssot/${path}`, {

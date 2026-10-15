@@ -15,7 +15,8 @@ import { SalesforceBatchClient } from "./batch-client";
 import { AgentAnalyzer } from "./agent-analyzer";
 import { ZipBuilder } from "./zip-builder";
 import { DataCloudClient, DATA_CLOUD_RETRIEVE_SUBREQUEST_BUDGET } from "./data-cloud-client";
-import { UnstructuredExtractor } from "./unstructured-extractor";
+import { UnstructuredExtractor, UNSTRUCTURED_LISTING_QUERIES } from "./unstructured-extractor";
+import type { UnstructuredFileListings } from "./unstructured-extractor";
 import { B2CacheManager } from "./b2-cache-manager";
 import { getAgentScripts, getCallableToolUrlsForChannel } from "../../tubot-sf-auth/src/agent-script";
 
@@ -115,14 +116,15 @@ export class Data360Extractor {
 
     const dataCloudClient = new DataCloudClient(conn, apiVersion);
     const catalog = options.includeMetadata !== false || options.includeDataCloudRecords !== false
-      ? await dataCloudClient.discover()
+      ? await dataCloudClient.discover({ includeObjectSchemas: options.includeObjectSchemas })
       : { dataSpaces: [], objects: [], identityResolutions: [], warnings: [] };
     warnings.push(...catalog.warnings);
     const models = catalog.objects.filter(o => ["dmo", "unified-dmo", "link-dmo", "udmo"].includes(o.family));
     const allDmoNames = [...new Set(models.map(o => o.name))];
 
-    // Steps 4-5: metadata (6) and CRM (8) subrequests share one composite batch
-    // call, saving one Worker subrequest per export.
+    // Steps 4-5: metadata (6), CRM (8), and unstructured discovery (3)
+    // subrequests share one composite batch call, so discovery costs no
+    // standalone Worker subrequest.
     const metadata: Data360Metadata = {
       channel: channelRecord,
       dataSpaces: options.includeMetadata !== false ? catalog.dataSpaces : [],
@@ -240,14 +242,36 @@ export class Data360Extractor {
       );
     }
 
-    const batchedSubrequests = [...metadataSubrequests, ...crmSubrequests];
+    const unstructuredSubrequests: BatchSubrequest[] = [];
+    if (options.includeUnstructuredFiles !== false) {
+      unstructuredSubrequests.push(
+        // 0: ContentVersion listing
+        {
+          method: "GET",
+          url: `${apiVersion}/query?q=${encodeURIComponent(UNSTRUCTURED_LISTING_QUERIES.contentVersion)}`,
+        },
+        // 1: Document listing
+        {
+          method: "GET",
+          url: `${apiVersion}/query?q=${encodeURIComponent(UNSTRUCTURED_LISTING_QUERIES.document)}`,
+        },
+        // 2: StaticResource listing
+        {
+          method: "GET",
+          url: `${apiVersion}/query?q=${encodeURIComponent(UNSTRUCTURED_LISTING_QUERIES.staticResource)}`,
+        },
+      );
+    }
+
+    const batchedSubrequests = [...metadataSubrequests, ...crmSubrequests, ...unstructuredSubrequests];
     totalSubrequests += batchedSubrequests.length;
     totalBatchRequests += Math.ceil(batchedSubrequests.length / SalesforceBatchClient.MAX_BATCH_SIZE);
     const batchedResponses = batchedSubrequests.length
       ? await this.batchClient.executeBatch(conn, batchedSubrequests, apiVersion)
       : [];
     const metaResponses = batchedResponses.slice(0, metadataSubrequests.length);
-    const crmResponses = batchedResponses.slice(metadataSubrequests.length);
+    const crmResponses = batchedResponses.slice(metadataSubrequests.length, metadataSubrequests.length + crmSubrequests.length);
+    const listingResponses = batchedResponses.slice(metadataSubrequests.length + crmSubrequests.length);
 
     if (options.includeMetadata !== false) {
       // Process DataSpace
@@ -299,9 +323,26 @@ export class Data360Extractor {
     let unstructuredFiles: ExtractedUnstructuredFile[] = [];
     if (options.includeUnstructuredFiles !== false) {
       try {
+        const listings: UnstructuredFileListings = {};
+        const listingKeys = ["contentVersion", "document", "staticResource"] as const;
+        for (let i = 0; i < listingKeys.length; i++) {
+          const res = listingResponses[i];
+          // Missing slice (e.g. short mocked batch results): leave the
+          // category unset so extractAllFiles falls back to a live query.
+          if (res === undefined) continue;
+          if (res.statusCode !== 200) {
+            const errBody =
+              typeof res.result === "string"
+                ? res.result
+                : JSON.stringify(res.result ?? `HTTP ${res.statusCode}`);
+            throw new Error(`SOQL query failed: ${errBody}`);
+          }
+          listings[listingKeys[i]] = Array.isArray(res.result?.records) ? res.result.records : [];
+        }
         unstructuredFiles = await this.unstructuredExtractor.extractAllFiles(conn, {
           maxFiles: options.maxUnstructuredFiles ?? 15,
           apiVersion,
+          listings,
         });
       } catch (err: unknown) {
         warnings.push(`Unstructured files extraction encountered an issue: ${err instanceof Error ? err.message : String(err)}`);
