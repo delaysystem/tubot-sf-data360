@@ -38,6 +38,34 @@ const KEY_PATTERN = /^[A-Za-z0-9/_.-]+$/;
 
 let kvBinding: KVNamespace | null = null;
 
+export interface CacheStats {
+  bound: boolean;
+  hits: number;
+  misses: number;
+  puts: number;
+  putErrors: number;
+  lastError: string;
+}
+
+const stats = { hits: 0, misses: 0, puts: 0, putErrors: 0, lastError: "" };
+
+export function getCacheStats(): CacheStats {
+  return { bound: kvBinding !== null, ...stats };
+}
+
+export function resetCacheStats(): void {
+  stats.hits = 0;
+  stats.misses = 0;
+  stats.puts = 0;
+  stats.putErrors = 0;
+  stats.lastError = "";
+}
+
+function recordError(err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
+  stats.lastError = message.slice(0, 200);
+}
+
 /**
  * Installs the KV namespace backing this module. Safe to call once per
  * request entry: the binding value is identical for every request of a
@@ -56,9 +84,15 @@ export async function cacheGetJSON<T>(key: string): Promise<T | null> {
     if (!isValidKey(key)) return null;
     if (!kvBinding) return null;
     const value = await kvBinding.get(key, "json");
-    if (value === null || value === undefined) return null;
+    if (value === null || value === undefined) {
+      stats.misses++;
+      return null;
+    }
+    stats.hits++;
     return value as T;
-  } catch {
+  } catch (err: unknown) {
+    stats.misses++;
+    recordError(err);
     return null;
   }
 }
@@ -74,8 +108,10 @@ export async function cachePutJSON(
     await kvBinding.put(key, JSON.stringify(value), {
       expirationTtl: ttlSeconds,
     });
-  } catch {
-    // Degrade to no-op.
+    stats.puts++;
+  } catch (err: unknown) {
+    stats.putErrors++;
+    recordError(err);
   }
 }
 

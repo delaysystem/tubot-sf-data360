@@ -11,6 +11,7 @@ import type {
   UserData360Result,
   MessagingSessionData360Result,
 } from "./types";
+import { getCacheStats } from "./cache";
 import { SalesforceBatchClient } from "./batch-client";
 import { AgentAnalyzer } from "./agent-analyzer";
 import { ZipBuilder } from "./zip-builder";
@@ -415,6 +416,7 @@ export class Data360Extractor {
         totalBatchRequests,
         totalSubrequests,
         fileCount,
+        cache: getCacheStats(),
       },
       warnings: warnings.length > 0 ? warnings : undefined,
     };

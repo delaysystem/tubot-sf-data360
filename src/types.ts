@@ -323,6 +323,14 @@ export interface ExportManifest {
     totalBatchRequests: number;
     totalSubrequests: number;
     fileCount: number;
+    cache?: {
+      bound: boolean;
+      hits: number;
+      misses: number;
+      puts: number;
+      putErrors: number;
+      lastError: string;
+    };
   };
   b2Cache?: B2CacheMetadata;
   warnings?: string[];

@@ -8,6 +8,8 @@ import {
   cachePutJSON,
   cacheDelete,
   initCache,
+  getCacheStats,
+  resetCacheStats,
 } from "../src/cache";
 
 interface FakeKVStore {
@@ -37,6 +39,7 @@ function installFakeKV(): FakeKVStore {
 describe("cache layer", () => {
   afterEach(() => {
     initCache(null);
+    resetCacheStats();
   });
 
   it("exposes the expected TTLs and key builders", () => {
@@ -105,5 +108,29 @@ describe("cache layer", () => {
     expect(await cacheGetJSON("catalog/org1")).toBeNull();
     await cachePutJSON("catalog/org1", { x: 1 }, 60);
     await cacheDelete("catalog/org1");
+  });
+
+  it("reports bound state, hits, misses, puts, and errors", async () => {
+    resetCacheStats();
+    expect(getCacheStats().bound).toBe(false);
+    installFakeKV();
+    expect(getCacheStats().bound).toBe(true);
+    expect(await cacheGetJSON("catalog/missing")).toBeNull();
+    await cachePutJSON("catalog/a", { x: 1 }, 60);
+    expect(await cacheGetJSON("catalog/a")).toEqual({ x: 1 });
+    const stats = getCacheStats();
+    expect(stats.hits).toBe(1);
+    expect(stats.misses).toBe(1);
+    expect(stats.puts).toBe(1);
+    expect(stats.putErrors).toBe(0);
+    initCache({
+      get: vi.fn().mockRejectedValue(new Error("kv down")),
+      put: vi.fn().mockRejectedValue(new Error("kv down")),
+      delete: vi.fn().mockRejectedValue(new Error("kv down")),
+    } as unknown as KVNamespace);
+    await cachePutJSON("catalog/b", { x: 2 }, 60);
+    const after = getCacheStats();
+    expect(after.putErrors).toBe(1);
+    expect(after.lastError).toContain("kv down");
   });
 });
