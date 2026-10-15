@@ -14,7 +14,7 @@ import type {
 import { SalesforceBatchClient } from "./batch-client";
 import { AgentAnalyzer } from "./agent-analyzer";
 import { ZipBuilder } from "./zip-builder";
-import { DataCloudClient } from "./data-cloud-client";
+import { DataCloudClient, DATA_CLOUD_RETRIEVE_SUBREQUEST_BUDGET } from "./data-cloud-client";
 import { UnstructuredExtractor } from "./unstructured-extractor";
 import { B2CacheManager } from "./b2-cache-manager";
 import { getAgentScripts, getCallableToolUrlsForChannel } from "../../tubot-sf-auth/src/agent-script";
@@ -58,7 +58,10 @@ export class Data360Extractor {
       channelName: channelDeveloperName || options.channelId,
     };
 
-    try {
+    // SOAP retrieve costs several subrequests; only fetch when agent artifacts were requested.
+    if (!options.includeAgentScript && !options.includeAgentXml) {
+      warnings.push("Agent script retrieve skipped: agent artifacts were not requested.");
+    } else try {
       const retrieveResult = await getAgentScripts(conn, {
         agentNames: [agentName],
         channelNames: channelDeveloperName ? [channelDeveloperName] : undefined,
@@ -118,7 +121,8 @@ export class Data360Extractor {
     const models = catalog.objects.filter(o => ["dmo", "unified-dmo", "link-dmo", "udmo"].includes(o.family));
     const allDmoNames = [...new Set(models.map(o => o.name))];
 
-    // Step 4: Batched Metadata Retrieval
+    // Steps 4-5: metadata (6) and CRM (8) subrequests share one composite batch
+    // call, saving one Worker subrequest per export.
     const metadata: Data360Metadata = {
       channel: channelRecord,
       dataSpaces: options.includeMetadata !== false ? catalog.dataSpaces : [],
@@ -135,8 +139,9 @@ export class Data360Extractor {
       dmoCatalog: models.map(({ name, dataSpace, family, storageKey }) => ({ name, dataSpace, family, storageKey })),
     };
 
+    const metadataSubrequests: BatchSubrequest[] = [];
     if (options.includeMetadata !== false) {
-      const metadataSubrequests: BatchSubrequest[] = [
+      metadataSubrequests.push(
         // 0: DataSpace
         {
           method: "GET",
@@ -167,41 +172,9 @@ export class Data360Extractor {
           method: "GET",
           url: `${apiVersion}/query?q=${encodeURIComponent("SELECT Id, Name, SourceObject, TargetObject FROM MktDataLakeMapping LIMIT 50")}`,
         },
-      ];
-
-      totalSubrequests += metadataSubrequests.length;
-      totalBatchRequests += Math.ceil(metadataSubrequests.length / SalesforceBatchClient.MAX_BATCH_SIZE);
-
-      const metaResponses = await this.batchClient.executeBatch(conn, metadataSubrequests, apiVersion);
-
-      // Process DataSpace
-      if (metaResponses[0]?.statusCode === 200 && Array.isArray(metaResponses[0].result?.records)) {
-        metadata.dataSpaces = metaResponses[0].result.records;
-      }
-
-      // Process MarketSegment
-      if (metaResponses[1]?.statusCode === 200 && Array.isArray(metaResponses[1].result?.records)) {
-        metadata.marketSegments = metaResponses[1].result.records;
-      }
-
-      // Process IdentityResolutionRuleset
-      if (metaResponses[3]?.statusCode === 200 && Array.isArray(metaResponses[3].result?.records)) {
-        metadata.identityResolutionRules = metaResponses[3].result.records;
-      }
-
-      // Process DataStream
-      if (metaResponses[4]?.statusCode === 200 && Array.isArray(metaResponses[4].result?.records)) {
-        metadata.dataStreams = metaResponses[4].result.records;
-      }
-
-      // Process MktDataLakeMapping
-      if (metaResponses[5]?.statusCode === 200 && Array.isArray(metaResponses[5].result?.records)) {
-        metadata.dataLakeMappings = metaResponses[5].result.records;
-      }
-
+      );
     }
 
-    // Step 5: Batched Customer 360 Records Retrieval
     const records: Data360Records = {
       crm: {
         individuals: [],
@@ -216,10 +189,10 @@ export class Data360Extractor {
       dataCloud: {},
     };
 
+    const crmSubrequests: BatchSubrequest[] = [];
     if (options.includeCrmRecords !== false) {
       const channelIdFilter = channelRecord?.Id || (options.channelId && options.channelId.startsWith("0Mj") ? options.channelId : "");
-
-      const crmSubrequests: BatchSubrequest[] = [
+      crmSubrequests.push(
         // 0: Individual
         {
           method: "GET",
@@ -264,13 +237,46 @@ export class Data360Extractor {
               : `SELECT Id, ChannelName, ChannelType, Status, CreatedDate FROM MessagingSession ORDER BY CreatedDate DESC LIMIT 100`
           )}`,
         },
-      ];
+      );
+    }
 
-      totalSubrequests += crmSubrequests.length;
-      totalBatchRequests += Math.ceil(crmSubrequests.length / SalesforceBatchClient.MAX_BATCH_SIZE);
+    const batchedSubrequests = [...metadataSubrequests, ...crmSubrequests];
+    totalSubrequests += batchedSubrequests.length;
+    totalBatchRequests += Math.ceil(batchedSubrequests.length / SalesforceBatchClient.MAX_BATCH_SIZE);
+    const batchedResponses = batchedSubrequests.length
+      ? await this.batchClient.executeBatch(conn, batchedSubrequests, apiVersion)
+      : [];
+    const metaResponses = batchedResponses.slice(0, metadataSubrequests.length);
+    const crmResponses = batchedResponses.slice(metadataSubrequests.length);
 
-      const crmResponses = await this.batchClient.executeBatch(conn, crmSubrequests, apiVersion);
+    if (options.includeMetadata !== false) {
+      // Process DataSpace
+      if (metaResponses[0]?.statusCode === 200 && Array.isArray(metaResponses[0].result?.records)) {
+        metadata.dataSpaces = metaResponses[0].result.records;
+      }
 
+      // Process MarketSegment
+      if (metaResponses[1]?.statusCode === 200 && Array.isArray(metaResponses[1].result?.records)) {
+        metadata.marketSegments = metaResponses[1].result.records;
+      }
+
+      // Process IdentityResolutionRuleset
+      if (metaResponses[3]?.statusCode === 200 && Array.isArray(metaResponses[3].result?.records)) {
+        metadata.identityResolutionRules = metaResponses[3].result.records;
+      }
+
+      // Process DataStream
+      if (metaResponses[4]?.statusCode === 200 && Array.isArray(metaResponses[4].result?.records)) {
+        metadata.dataStreams = metaResponses[4].result.records;
+      }
+
+      // Process MktDataLakeMapping
+      if (metaResponses[5]?.statusCode === 200 && Array.isArray(metaResponses[5].result?.records)) {
+        metadata.dataLakeMappings = metaResponses[5].result.records;
+      }
+    }
+
+    if (options.includeCrmRecords !== false) {
       if (crmResponses[0]?.statusCode === 200) records.crm.individuals = crmResponses[0].result?.records || [];
       if (crmResponses[1]?.statusCode === 200) records.crm.contactPointEmails = crmResponses[1].result?.records || [];
       if (crmResponses[2]?.statusCode === 200) records.crm.contactPointPhones = crmResponses[2].result?.records || [];
@@ -283,7 +289,7 @@ export class Data360Extractor {
 
     // Data 360 retrieval is owned by the worker, including B2-bound snapshots.
     if (options.includeDataCloudRecords !== false) {
-      const retrieved = await dataCloudClient.retrieve(catalog.objects, discovered.dmoNames, maxRecords);
+      const retrieved = await dataCloudClient.retrieve(catalog.objects, discovered.dmoNames, maxRecords, { subrequestBudget: DATA_CLOUD_RETRIEVE_SUBREQUEST_BUDGET });
       records.dataCloud = retrieved.dataCloud;
       records.dataGraphs = retrieved.dataGraphs;
       warnings.push(...retrieved.warnings);

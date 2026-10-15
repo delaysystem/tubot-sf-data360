@@ -32,14 +32,13 @@ Pass `--agent` or `--channel` to select a real target; otherwise the first live 
 
 Snapshots use `<prefix>/<verified-org>/<target>/snapshots/<snapshot-id>/`:
 
-- `metadata/<family>.json`: complete discovered catalogs, with data-space context.
-- `data/<family>.json`: records keyed by object API name; duplicate names use a data-space-qualified key.
-- `metadata/context.json`, `data/crm.json`, `agent/context.json`.
+- `data/<family>.json`: `{ metadata, rows }` envelope holding the complete discovered catalog (with data-space context) and records keyed by object API name; duplicate names use a data-space-qualified key.
+- `metadata/context.json` (`{ metadata, agent }`), `data/crm.json`.
 - `metadata/files.json` and original file bytes under `files/<category>/<id>/<filename>`.
 - `manifest.json`: scope, family mapping, byte counts, and file checksums.
 
 `latest.json` is published after all snapshot files finish uploading. New B2 snapshots contain neither a ZIP export nor `data-bundle.json`. Explicit `/export` ZIP responses and legacy B2 snapshot reads remain supported.
 
-Retrieval includes all agent-referenced catalog objects and one populated representative of each family, bounded by `maxRecords` (default 500, Data 360 reads capped at 5,000). Catalog discovery does not imply every object's rows are exported.
+Retrieval includes all agent-referenced catalog objects and one populated representative of each family, bounded by `maxRecords` (default 500, Data 360 reads capped at 5,000). Catalog discovery does not imply every object's rows are exported. Row retrieval stops gracefully with a warning if the Worker's subrequest budget is exhausted, leaving partial family coverage.
 
 HTTP cache reads require `Authorization: Bearer <Salesforce token>` and `x-salesforce-instance-url`. The verified token organization selects the B2 prefix; a conflicting `orgId` returns 403. `/cache/query` accepts `objectType`, `objectName`, optional `dataSpace`, and optional `snapshotId`. Supported type values are `dlo`, `dmo`, `unified-dmo`, `link-dmo`, `udmo`, `data-graph`, and `calculated-insight`. The older `dmo`, `crmEntity`, and `file` parameters still work. RPC cache methods require explicit Salesforce credentials or a complete tenant scope resolved through the signed `tubot-sf-auth` bridge.

@@ -7,8 +7,20 @@ export const sqlIdentifier = (value: string): string => {
 };
 
 /** Live Data 360 Connect API transport. Never substitutes CRM files for UDMOs. */
+const CATALOG_PAGE_SIZE = 1000;
+/** Catalog keys whose pages must stay small: API maximums and multi-MB payloads. */
+const SMALL_CATALOG_PAGES: Record<string, number> = { collection: 200, dataModelObject: 200 };
+
+export class DataCloudBudgetExhaustedError extends Error {
+  constructor() { super("Data 360 retrieval stopped: subrequest budget exhausted"); }
+}
+
+/** Caps Data 360 row retrieval so a full export fits the Workers 50-subrequest invocation limit. */
+export const DATA_CLOUD_RETRIEVE_SUBREQUEST_BUDGET = 16;
+
 export class DataCloudClient {
   private readonly root: string;
+  private subrequestBudget: number | null = null;
   constructor(private readonly connection: SalesforceConnection, apiVersion: string) {
     if (!/^v\d+\.\d+$/.test(apiVersion)) throw new Error("Invalid Salesforce API version");
     this.root = `/services/data/${apiVersion}/`;
@@ -17,6 +29,10 @@ export class DataCloudClient {
   async request(path: string, method = "GET", body?: unknown): Promise<any> {
     const relative = path.startsWith("/") ? path : `${this.root}ssot/${path}`;
     if (!relative.startsWith(this.root) || relative.includes("..")) throw new Error("Invalid Data 360 API page URL");
+    if (this.subrequestBudget !== null) {
+      if (this.subrequestBudget <= 0) throw new DataCloudBudgetExhaustedError();
+      this.subrequestBudget--;
+    }
     const response = await fetch(new URL(relative, this.connection.instanceUrl), {
       method, signal: AbortSignal.timeout(60_000),
       headers: { Authorization: `Bearer ${this.connection.accessToken}`, Accept: "application/json", ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
@@ -35,7 +51,8 @@ export class DataCloudClient {
     const seen = new Set<string>();
     const pageSignatures = new Set<string>();
     let offset = 0;
-    let next: string | undefined = `${path}?${new URLSearchParams({ ...(dataSpace ? { dataspace: dataSpace } : {}), ...(key === "collection" ? { batchSize: "200" } : { limit: "200" }), offset: "0" })}`;
+    const pageSize = SMALL_CATALOG_PAGES[key] ?? CATALOG_PAGE_SIZE;
+    let next: string | undefined = `${path}?${new URLSearchParams({ ...(dataSpace ? { dataspace: dataSpace } : {}), ...(key === "collection" ? { batchSize: String(pageSize) } : { limit: String(pageSize) }), offset: "0" })}`;
     while (next) {
       if (seen.has(next)) throw new Error(`Data 360 ${path} repeated a catalog page`);
       seen.add(next);
@@ -50,8 +67,8 @@ export class DataCloudClient {
       offset += page.length;
       next = collection.nextPageUrl || undefined;
       // DMO catalog has no pagination envelope: continue until its short page.
-      if (!next && key === "dataModelObject" && page.length === 200) {
-        next = `${path}?${new URLSearchParams({ ...(dataSpace ? { dataspace: dataSpace } : {}), limit: "200", offset: String(offset) })}`;
+      if (!next && key === "dataModelObject" && page.length === pageSize) {
+        next = `${path}?${new URLSearchParams({ ...(dataSpace ? { dataspace: dataSpace } : {}), limit: String(pageSize), offset: String(offset) })}`;
       }
     }
     return rows;
@@ -185,7 +202,7 @@ export class DataCloudClient {
     return rows.slice(0, max);
   }
 
-  async retrieve(objects: DataCloudObject[], referenced: string[], maxRecords: number) {
+  async retrieve(objects: DataCloudObject[], referenced: string[], maxRecords: number, opts?: { subrequestBudget?: number }) {
     const dataCloud: Record<string, Row[]> = {};
     const dataGraphs: Record<string, Row[]> = {};
     const warnings: string[] = [];
@@ -197,19 +214,28 @@ export class DataCloudClient {
         (object.family === "data-graph" ? dataGraphs : dataCloud)[object.storageKey] = rows;
         return rows.length > 0;
       } catch (error) {
+        if (error instanceof DataCloudBudgetExhaustedError) throw error;
         if (/HTTP (401|403)/.test(String(error))) throw error;
         warnings.push(`${object.family} ${object.storageKey}: ${error instanceof Error ? error.message : "retrieval failed"}`);
         return false;
       }
     };
-    for (const object of objects.filter(o => referenced.includes(o.name))) await read(object);
-    for (const family of DATA_CLOUD_FAMILIES) {
-      const candidates = objects.filter(o => o.family === family && o.metadata.isEnabled !== false &&
-        (family !== "dmo" || !["Adg", "Semantic"].includes(o.metadata.creationType)));
-      if (candidates.some(o => (family === "data-graph" ? dataGraphs : dataCloud)[o.storageKey]?.length)) continue;
-      for (const object of candidates) {
-        if (!tried.has(object.storageKey) && await read(object)) break;
+    this.subrequestBudget = opts?.subrequestBudget ?? null;
+    try {
+      for (const object of objects.filter(o => referenced.includes(o.name))) await read(object);
+      for (const family of DATA_CLOUD_FAMILIES) {
+        const candidates = objects.filter(o => o.family === family && o.metadata.isEnabled !== false &&
+          (family !== "dmo" || !["Adg", "Semantic"].includes(o.metadata.creationType)));
+        if (candidates.some(o => (family === "data-graph" ? dataGraphs : dataCloud)[o.storageKey]?.length)) continue;
+        for (const object of candidates) {
+          if (!tried.has(object.storageKey) && await read(object)) break;
+        }
       }
+    } catch (error) {
+      if (!(error instanceof DataCloudBudgetExhaustedError)) throw error;
+      warnings.push("Data 360 family coverage is partial: subrequest budget exhausted");
+    } finally {
+      this.subrequestBudget = null;
     }
     return { dataCloud, dataGraphs, warnings };
   }

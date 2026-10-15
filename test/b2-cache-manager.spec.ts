@@ -213,10 +213,12 @@ describe("B2CacheManager", () => {
       expect(keys).toContain(b2Meta.basePath + '/data/dmo.json');
       expect(keys).toContain(b2Meta.basePath + '/metadata/files.json');
       expect(keys.filter(key => key.includes('/files/'))).toHaveLength(2);
-      expect(keys).toHaveLength(22);
-      expect(samplePkg.manifest.storage?.layoutVersion).toBe(2);
-      const rows = JSON.parse(new TextDecoder().decode(mockClient.files.get(b2Meta.basePath + '/data/dmo.json')!.data));
-      expect(rows.UnifiedIndividual__dlm[0].firstName__c).toBe('John');
+      expect(keys.some(key => /\/metadata\/(dlo|dmo|unified-dmo|link-dmo|udmo|data-graph|calculated-insight)\.json$/.test(key))).toBe(false);
+      expect(keys).toHaveLength(14);
+      expect(samplePkg.manifest.storage?.layoutVersion).toBe(3);
+      const envelope = JSON.parse(new TextDecoder().decode(mockClient.files.get(b2Meta.basePath + '/data/dmo.json')!.data));
+      expect(envelope.rows.UnifiedIndividual__dlm[0].firstName__c).toBe('John');
+      expect(envelope.metadata).toBeDefined();
     });
 
     it("handles package without zipBytes or unstructured files", async () => {
@@ -516,6 +518,26 @@ describe("B2CacheManager", () => {
         snapshotId: "snap-legacy",
       });
       expect(file).toBe("legacy bytes");
+    });
+
+    it("reads layout v2 snapshots with bare per-family row files", async () => {
+      const prefix = "data360/acme-corp/0Mj000000000001/snapshots/snap-v2";
+      const enc = new TextEncoder();
+      mockClient.files.set(`${prefix}/manifest.json`, {
+        data: enc.encode(JSON.stringify({
+          version: "2.0.0",
+          storage: { layoutVersion: 2, objectFamilies: { Legacy__dlm: "dmo" }, files: [] },
+        })),
+      });
+      mockClient.files.set(`${prefix}/data/dmo.json`, {
+        data: enc.encode(JSON.stringify({ Legacy__dlm: [{ firstName__c: "V2" }] })),
+      });
+
+      const dmo = await cacheManager.queryCachedEntity("acme-corp", "0Mj000000000001", {
+        dmo: "Legacy__dlm",
+        snapshotId: "snap-v2",
+      });
+      expect(dmo[0].firstName__c).toBe("V2");
     });
 
     it("returns null for non-existent entities", async () => {

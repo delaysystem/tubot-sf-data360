@@ -278,7 +278,7 @@ export interface DataCloudObject {
 
 export interface ExportManifest {
   storage?: {
-    layoutVersion: 2;
+    layoutVersion: 2 | 3;
     objectFamilies: Record<string, DataCloudFamily>;
     objectDataSpaces?: Record<string, string>;
     files: Array<{ path: string; bytes: number; sha256: string }>;

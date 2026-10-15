@@ -225,6 +225,60 @@ describe("tubot-sf-data360 export pipeline", () => {
     expect(data.manifest.target.agentName).toBe("DATA360TEST");
   });
 
+  it("skips SOAP agent retrieve unless agent artifacts are requested", async () => {
+    const soapUrls: string[] = [];
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/services/Soap/m/")) soapUrls.push(urlStr);
+      const catalogResponse = connectApiCoverageResponse(urlStr);
+      if (catalogResponse) return catalogResponse;
+      if (urlStr.includes("/composite/batch")) {
+        return Response.json({ hasErrors: false, results: [] });
+      }
+      return Response.json({ records: [] });
+    });
+
+    const env: Data360Env = {
+      SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
+      TUBOT_SF_AUTH: {
+        getTokenForChannel: vi.fn().mockResolvedValue({
+          accessToken: "mock-test-token",
+          instanceUrl: "https://test.my.salesforce.com",
+          orgId: "00D000000000001AAA",
+          teamId: "team-1",
+        }),
+      },
+    };
+    const postExport = (body: unknown) =>
+      worker.fetch(
+        new Request("https://data360.internal/export", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+        env
+      );
+
+    const plain = await postExport({
+      agentName: "DATA360TEST",
+      format: "json",
+      teamId: "team-1",
+      orgId: "00D000000000001AAA",
+    });
+    expect(plain.status).toBe(200);
+    expect(soapUrls).toHaveLength(0);
+
+    const withScript = await postExport({
+      agentName: "DATA360TEST",
+      format: "json",
+      includeAgentScript: true,
+      teamId: "team-1",
+      orgId: "00D000000000001AAA",
+    });
+    expect(withScript.status).toBe(200);
+    expect(soapUrls.length).toBeGreaterThan(0);
+  });
+
   it("returns 400 when neither channelId nor agentName is provided", async () => {
     const req = new Request("https://data360.internal/export", {
       method: "POST",

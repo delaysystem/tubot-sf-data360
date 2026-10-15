@@ -301,7 +301,7 @@ describe("POST /cache/refresh recency short-circuit", () => {
     for (const u of fetchedUrls) {
       expect(u).not.toMatch(/ContentVersion|ContentDocument|StaticResource|\/sfc\//);
     }
-    // Seven metadata/data pairs, context, CRM, agent, file index, manifest, latest.
-    expect(fetchedUrls.filter((u) => u.includes("upload.backblazeb2.com"))).toHaveLength(20);
+    // Seven family envelopes, context (with agent), CRM, file index, manifest, latest.
+    expect(fetchedUrls.filter((u) => u.includes("upload.backblazeb2.com"))).toHaveLength(12);
   });
 });

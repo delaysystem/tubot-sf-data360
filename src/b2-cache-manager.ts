@@ -524,14 +524,12 @@ export class B2CacheManager {
       const rows = Object.fromEntries(Object.entries(source).filter(([name]) => objectFamilies[name] === family));
       const metadata = objects.length ? objects.map(o => ({ ...o.metadata, dataSpace: o.dataSpace, storageKey: o.storageKey }))
         : metadataFallback[family] ?? [];
-      await json(`metadata/${family}.json`, metadata);
-      await json(`data/${family}.json`, rows);
+      await json(`data/${family}.json`, { metadata, rows });
     }
     const { dataCloudObjects, dataLakeObjects, dataModelObjects, dataGraphs,
       calculatedInsights, dmoDescribes, ...context } = pkg.metadata;
-    await json("metadata/context.json", context);
+    await json("metadata/context.json", { metadata: context, agent: pkg.agent });
     await json("data/crm.json", pkg.records.crm);
-    await json("agent/context.json", pkg.agent);
     const fileIndex = [];
     for (const file of pkg.unstructuredFiles ?? []) {
       const path = `files/${encodeURIComponent(file.category)}/${encodeURIComponent(file.id)}/${encodeURIComponent(file.filename)}`;
@@ -540,7 +538,7 @@ export class B2CacheManager {
       fileIndex.push({ ...metadata, path });
     }
     await json("metadata/files.json", fileIndex);
-    pkg.manifest.storage = { layoutVersion: 2, objectFamilies,
+    pkg.manifest.storage = { layoutVersion: 3, objectFamilies,
       objectDataSpaces: Object.fromEntries(descriptors.map(o => [o.storageKey, o.dataSpace])), files };
     const metadata: B2CacheMetadata = {
       stored: true,
@@ -636,11 +634,16 @@ export class B2CacheManager {
     const snapshotPrefix = `${this.rootPrefix()}/${orgId}/${cleanTargetId}/snapshots/${snapshotId}`;
     const storedManifestBytes = await this.doDownload(`${snapshotPrefix}/manifest.json`);
     const manifest = storedManifestBytes ? JSON.parse(new TextDecoder().decode(storedManifestBytes)) as ExportManifest : null;
-    if (manifest?.storage?.layoutVersion === 2) {
+    if (manifest?.storage?.layoutVersion === 2 || manifest?.storage?.layoutVersion === 3) {
+      const enveloped = manifest.storage.layoutVersion === 3;
       const readJson = async (path: string) => {
         const bytes = await this.doDownload(`${snapshotPrefix}/${path}`);
         if (!bytes) throw new Error(`B2 snapshot is incomplete: ${path}`);
         return JSON.parse(new TextDecoder().decode(bytes));
+      };
+      const readFamilyRows = async (family: DataCloudFamily) => {
+        const doc = await readJson(`data/${family}.json`);
+        return enveloped ? doc.rows : doc;
       };
       if (query.objectType && !DATA_CLOUD_FAMILIES.includes(query.objectType)) throw new Error("Unknown Data 360 object type");
       const objectName = query.objectName ?? query.dmo;
@@ -654,9 +657,9 @@ export class B2CacheManager {
         if (matches.length > 1) throw new Error("Object name is ambiguous; specify its data space-qualified name");
         const key = matches[0];
         const family = manifest.storage.objectFamilies[key];
-        return (await readJson(`data/${family}.json`))[key] ?? null;
+        return (await readFamilyRows(family))[key] ?? null;
       }
-      if (query.objectType) return readJson(`data/${query.objectType}.json`);
+      if (query.objectType) return readFamilyRows(query.objectType);
       if (query.crmEntity) {
         const entity = query.crmEntity.replace(/\.json$/, "");
         const key = Object.entries(CRM_ENTITY_MAP).find(([, name]) => name === entity)?.[0] ?? entity;

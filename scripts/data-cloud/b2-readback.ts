@@ -38,7 +38,7 @@ async function main() {
     const relative = file.fileName.slice(prefix.length);
     if (relative === "manifest.json") {
       const actual = JSON.parse(new TextDecoder().decode(data)) as ExportManifest;
-      if (actual.b2Cache?.snapshotId !== cache.snapshotId || actual.storage?.layoutVersion !== 2) throw Error("B2 manifest does not identify the written snapshot");
+      if (actual.b2Cache?.snapshotId !== cache.snapshotId || actual.storage?.layoutVersion !== 3) throw Error("B2 manifest does not identify the written snapshot");
       continue;
     }
     const expected = manifest.storage?.files.find(f => f.path === relative);

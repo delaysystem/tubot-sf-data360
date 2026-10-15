@@ -36,15 +36,22 @@ async function main() {
   report({ stage: "worker-retrieval-and-B2-write", target, runtime: workerUrl ? "HTTP Worker" : "actual Worker handler in Bun" });
   const progress = setInterval(() => report({ waiting: "Worker is retrieving live Salesforce catalogs and storing B2 family files" }), 30_000);
   let pkg: ExtractedData360Package;
+  let exportSubrequests = 0;
+  const innerFetch = globalThis.fetch;
   try {
+    if (!workerUrl) globalThis.fetch = ((...args: any[]) => { exportSubrequests++; return (innerFetch as any)(...args); }) as typeof fetch;
     const response = await invoke("/export", {
       method: "POST", headers: { Authorization: `Bearer ${conn.accessToken}`, "x-salesforce-instance-url": conn.instanceUrl, "Content-Type": "application/json" },
       body: JSON.stringify(options), signal: AbortSignal.timeout(900_000),
     });
     if (!response.ok) throw Error(`Actual Worker export/cache request failed with HTTP ${response.status}`);
     pkg = await response.json() as ExtractedData360Package;
-  } finally { clearInterval(progress); }
-  if (!pkg.b2Cache?.stored || pkg.manifest.storage?.layoutVersion !== 2) throw Error("Worker did not store the new B2 snapshot layout");
+  } finally { globalThis.fetch = innerFetch; clearInterval(progress); }
+  if (!workerUrl) {
+    report({ exportSubrequests });
+    if (exportSubrequests >= 49) throw Error(`Export used ${exportSubrequests} subrequests; the deployed platform allows 50 per invocation. Cut requests before catalog growth breaks the deployed export.`);
+  }
+  if (!pkg.b2Cache?.stored || pkg.manifest.storage?.layoutVersion !== 3) throw Error("Worker did not store the new B2 snapshot layout");
   const sourceCount = await sf(target, ["data", "query", "--query", "SELECT Id FROM Lead LIMIT 1"]);
   if (pkg.records.crm.leads.length !== sourceCount.records.length) throw Error("CRM source rows differ from independent Salesforce CLI readback");
   if (pkg.zipBytes || pkg.b2Cache.zipUrl) throw Error("B2 verification flow produced a ZIP");
@@ -84,7 +91,7 @@ async function main() {
     if (await checker.exited) throw Error("Independent B2 readback process failed");
   } finally { await rm(directory, { recursive: true, force: true }); }
   const missing = DATA_CLOUD_FAMILIES.filter(family => coverage[family].rows === 0);
-  report({ coverage, missing, snapshotId: pkg.b2Cache.snapshotId, storageLayout: 2 });
+  report({ coverage, missing, snapshotId: pkg.b2Cache.snapshotId, storageLayout: 3 });
   if (missing.length) throw Error(`Live all-types gate failed: no real result rows for ${missing.join(", ")}. Seed the target, then rerun.`);
   report({ ok: true, liveFamiliesVerified: DATA_CLOUD_FAMILIES.length });
 }
