@@ -17,6 +17,7 @@ import { SalesforceAuthBridge, SalesforceAuthorizationError } from "./auth-clien
 import { Data360Extractor } from "./data360-extractor";
 import { B2CacheManager } from "./b2-cache-manager";
 import { claimServiceNonce, readSigHeaders, verifyServiceSignature } from "./service-verify";
+import { initCache } from "./cache";
 import {
   D1Data360Cache,
   purgeEdgeCache,
@@ -52,6 +53,13 @@ try {
 }
 
 export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
+  constructor(ctx: any, env: any) {
+    super(ctx, env);
+    // RPC entries run without fetch(); install the KV cache backend here
+    // so every RPC method that reaches cached code is covered.
+    initCache(env?.DATA360_KV);
+  }
+
   /**
    * RPC method: returns the exported Data 360 zip as Uint8Array bytes.
    */
@@ -993,6 +1001,7 @@ function parseHeadersForAuth(request: Request, options: ExportData360Options): E
 
 export default {
   async fetch(request: Request, env: Data360Env, ctx?: any): Promise<Response> {
+    initCache(env.DATA360_KV);
     try {
       const url = new URL(request.url);
       const path = url.pathname;

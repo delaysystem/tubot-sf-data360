@@ -1,6 +1,6 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { AgentAnalyzer } from "../src/agent-analyzer";
-import { CACHE_TTL, channelMapCacheKey } from "../src/cache";
+import { CACHE_TTL, channelMapCacheKey, initCache } from "../src/cache";
 import type { SalesforceConnection } from "../src/types";
 
 describe("AgentAnalyzer", () => {
@@ -103,20 +103,25 @@ describe("AgentAnalyzer channel-map caching", () => {
   };
   const channelId = "0Mjg5000000VtMnCAK";
 
-  function installFakeCaches() {
-    const store = new Map<string, Response>();
-    const match = vi.fn(async (req: Request) => {
-      const hit = store.get(req.url);
-      return hit ? hit.clone() : undefined;
+  afterEach(() => {
+    initCache(null);
+  });
+
+  function installFakeKV() {
+    const store = new Map<string, string>();
+    const get = vi.fn(async (key: string, type?: string) => {
+      const hit = store.get(key);
+      if (hit === undefined) return null;
+      return type === "json" ? JSON.parse(hit) : hit;
     });
-    const put = vi.fn(async (req: Request, res: Response) => {
-      store.set(req.url, res.clone());
+    const put = vi.fn(async (key: string, value: string, _options?: unknown) => {
+      store.set(key, value);
     });
-    const deleter = vi.fn(async (req: Request) => store.delete(req.url));
-    (globalThis as any).caches = {
-      default: { match, put, delete: deleter },
-    };
-    return { store, match, put };
+    const deleter = vi.fn(async (key: string) => {
+      store.delete(key);
+    });
+    initCache({ get, put, delete: deleter } as unknown as KVNamespace);
+    return { store, get, put };
   }
 
   function installSalesforceFetch() {
@@ -157,22 +162,18 @@ describe("AgentAnalyzer channel-map caching", () => {
   it("returns the cached resolution on a channel-map hit without querying Salesforce", async () => {
     const analyzer = new AgentAnalyzer();
     const originalFetch = globalThis.fetch;
-    const originalCaches = (globalThis as any).caches;
-    const fake = installFakeCaches();
+    const fake = installFakeKV();
     const fetchMock = installSalesforceFetch();
     globalThis.fetch = fetchMock;
     try {
       const key = channelMapCacheKey(orgId, channelId);
       fake.store.set(
-        `https://cache.internal/v1/${key}`,
-        Response.json(
-          {
-            agentName: "CACHED_AGENT",
-            channelRecord: { Id: channelId, DeveloperName: "Cached_Channel" },
-            channelDeveloperName: "Cached_Channel",
-          },
-          { headers: { "Cache-Control": `max-age=${CACHE_TTL.channelMap}` } }
-        )
+        key,
+        JSON.stringify({
+          agentName: "CACHED_AGENT",
+          channelRecord: { Id: channelId, DeveloperName: "Cached_Channel" },
+          channelDeveloperName: "Cached_Channel",
+        })
       );
 
       const resolved = await analyzer.resolveChannelAndAgent(connWithOrg, channelId);
@@ -182,15 +183,14 @@ describe("AgentAnalyzer channel-map caching", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       globalThis.fetch = originalFetch;
-      (globalThis as any).caches = originalCaches;
+      initCache(null);
     }
   });
 
   it("stores the resolution on a miss and serves the second call from cache", async () => {
     const analyzer = new AgentAnalyzer();
     const originalFetch = globalThis.fetch;
-    const originalCaches = (globalThis as any).caches;
-    const fake = installFakeCaches();
+    const fake = installFakeKV();
     const fetchMock = installSalesforceFetch();
     globalThis.fetch = fetchMock;
     try {
@@ -200,10 +200,12 @@ describe("AgentAnalyzer channel-map caching", () => {
       expect(fetchMock).toHaveBeenCalled();
 
       const key = channelMapCacheKey(orgId, channelId);
-      const stored = fake.store.get(`https://cache.internal/v1/${key}`);
+      const stored = fake.store.get(key);
       expect(stored).toBeDefined();
-      expect(stored?.headers.get("Cache-Control")).toBe(`max-age=${CACHE_TTL.channelMap}`);
-      expect(await stored?.clone().json()).toEqual({
+      expect(fake.put).toHaveBeenCalledWith(key, expect.any(String), {
+        expirationTtl: CACHE_TTL.channelMap,
+      });
+      expect(JSON.parse(stored!)).toEqual({
         agentName: "DATA360TEST",
         channelRecord: expect.objectContaining({ Id: channelId }),
         channelDeveloperName: "Data360_Channel",
@@ -215,15 +217,14 @@ describe("AgentAnalyzer channel-map caching", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       globalThis.fetch = originalFetch;
-      (globalThis as any).caches = originalCaches;
+      initCache(null);
     }
   });
 
   it("skips caching entirely when conn.orgId is missing", async () => {
     const analyzer = new AgentAnalyzer();
     const originalFetch = globalThis.fetch;
-    const originalCaches = (globalThis as any).caches;
-    const fake = installFakeCaches();
+    const fake = installFakeKV();
     const fetchMock = installSalesforceFetch();
     globalThis.fetch = fetchMock;
     try {
@@ -234,12 +235,12 @@ describe("AgentAnalyzer channel-map caching", () => {
       const resolved = await analyzer.resolveChannelAndAgent(connNoOrg, channelId);
       expect(resolved.agentName).toBe("DATA360TEST");
       expect(fetchMock).toHaveBeenCalled();
-      expect(fake.match).not.toHaveBeenCalled();
+      expect(fake.get).not.toHaveBeenCalled();
       expect(fake.put).not.toHaveBeenCalled();
       expect(fake.store.size).toBe(0);
     } finally {
       globalThis.fetch = originalFetch;
-      (globalThis as any).caches = originalCaches;
+      initCache(null);
     }
   });
 });

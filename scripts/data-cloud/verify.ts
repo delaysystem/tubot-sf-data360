@@ -44,7 +44,7 @@ async function main() {
       method: "POST", headers: { Authorization: `Bearer ${conn.accessToken}`, "x-salesforce-instance-url": conn.instanceUrl, "Content-Type": "application/json" },
       body: JSON.stringify(options), signal: AbortSignal.timeout(900_000),
     });
-    if (!response.ok) throw Error(`Actual Worker export/cache request failed with HTTP ${response.status}`);
+    if (!response.ok) throw Error(`Actual Worker export/cache request failed with HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
     pkg = await response.json() as ExtractedData360Package;
   } finally { globalThis.fetch = innerFetch; clearInterval(progress); }
   if (!workerUrl) {

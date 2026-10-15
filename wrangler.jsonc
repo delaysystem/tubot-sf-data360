@@ -32,6 +32,12 @@
       "database_id": "8f100c42-cb9a-44aa-b995-391f942edf10"
     }
   ],
+  "kv_namespaces": [
+    {
+      "binding": "DATA360_KV",
+      "id": "bbd0c91c063b4529b99256c1af508d9a"
+    }
+  ],
   "env": {
     "production": {
       "name": "tubot-sf-data360-production",
@@ -55,6 +61,12 @@
           "binding": "DB",
           "database_name": "agent-dashboard-db-production",
           "database_id": "0334422a-b534-4322-be11-9e195947b348"
+        }
+      ],
+      "kv_namespaces": [
+        {
+          "binding": "DATA360_KV",
+          "id": "b668578a050d4d60903de4e045adca66"
         }
       ]
     }

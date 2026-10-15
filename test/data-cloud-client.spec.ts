@@ -1,22 +1,23 @@
 import { describe, it, expect, vi } from "vitest";
 import { DataCloudClient, DATA_CLOUD_RETRIEVE_SUBREQUEST_BUDGET } from "../src/data-cloud-client";
-import { CACHE_TTL, cacheGetJSON, cachePutJSON, lastGoodCacheKey } from "../src/cache";
+import { CACHE_TTL, cacheGetJSON, cachePutJSON, initCache, lastGoodCacheKey } from "../src/cache";
 import type { DataCloudObject, SalesforceConnection } from "../src/types";
 
-function installFakeCaches(): Map<string, Response> {
-  const store = new Map<string, Response>();
-  (globalThis as any).caches = {
-    default: {
-      match: async (req: Request) => {
-        const hit = store.get(req.url);
-        return hit ? hit.clone() : undefined;
-      },
-      put: async (req: Request, res: Response) => {
-        store.set(req.url, res.clone());
-      },
-      delete: async (req: Request) => store.delete(req.url),
+function installFakeKV(): Map<string, string> {
+  const store = new Map<string, string>();
+  initCache({
+    get: async (key: string, type?: string) => {
+      const hit = store.get(key);
+      if (hit === undefined) return null;
+      return type === "json" ? JSON.parse(hit) : hit;
     },
-  };
+    put: async (key: string, value: string, _options?: unknown) => {
+      store.set(key, value);
+    },
+    delete: async (key: string) => {
+      store.delete(key);
+    },
+  } as unknown as KVNamespace);
   return store;
 }
 
@@ -213,8 +214,7 @@ describe("DataCloudClient", () => {
   });
 
   it("serves discovery from the catalog cache without fetching", async () => {
-    const originalCaches = (globalThis as any).caches;
-    installFakeCaches();
+    installFakeKV();
     const client = new DataCloudClient({ ...conn, orgId: "00Dcatalog1" }, "v68.0");
     const fetchState = installCatalogFetch();
     try {
@@ -239,7 +239,7 @@ describe("DataCloudClient", () => {
       }
     } finally {
       fetchState.restore();
-      (globalThis as any).caches = originalCaches;
+      initCache(null);
     }
   });
 
@@ -273,8 +273,7 @@ describe("DataCloudClient", () => {
   });
 
   it("queries the hinted last-good object first", async () => {
-    const originalCaches = (globalThis as any).caches;
-    installFakeCaches();
+    installFakeKV();
     const orgId = "00DhintFirst";
     await cachePutJSON(lastGoodCacheKey(orgId, "dmo"), { storageKey: "Model2" }, CACHE_TTL.lastGood);
     const client = new DataCloudClient({ ...conn, orgId }, "v68.0");
@@ -295,13 +294,12 @@ describe("DataCloudClient", () => {
       expect(Object.keys(result.dataCloud)).toEqual(["Model2"]);
     } finally {
       globalThis.fetch = originalFetch;
-      (globalThis as any).caches = originalCaches;
+      initCache(null);
     }
   });
 
   it("falls through to a normal scan when the hint is stale", async () => {
-    const originalCaches = (globalThis as any).caches;
-    installFakeCaches();
+    installFakeKV();
     const orgId = "00DhintStale";
     await cachePutJSON(lastGoodCacheKey(orgId, "dmo"), { storageKey: "GhostObject" }, CACHE_TTL.lastGood);
     const client = new DataCloudClient({ ...conn, orgId }, "v68.0");
@@ -324,13 +322,12 @@ describe("DataCloudClient", () => {
       expect(await cacheGetJSON<{ storageKey: string }>(lastGoodCacheKey(orgId, "dmo"))).toEqual({ storageKey: "Model1" });
     } finally {
       globalThis.fetch = originalFetch;
-      (globalThis as any).caches = originalCaches;
+      initCache(null);
     }
   });
 
   it("stores a last-good hint after a successful read", async () => {
-    const originalCaches = (globalThis as any).caches;
-    installFakeCaches();
+    installFakeKV();
     const orgId = "00DhintStore";
     const client = new DataCloudClient({ ...conn, orgId }, "v68.0");
     const originalFetch = globalThis.fetch;
@@ -343,7 +340,7 @@ describe("DataCloudClient", () => {
       expect(await cacheGetJSON<{ storageKey: string }>(lastGoodCacheKey(orgId, "dmo"))).toEqual({ storageKey: "Model1" });
     } finally {
       globalThis.fetch = originalFetch;
-      (globalThis as any).caches = originalCaches;
+      initCache(null);
     }
   });
 });

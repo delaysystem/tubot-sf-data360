@@ -1,12 +1,19 @@
 /**
- * Cloudflare Cache API TTL caching layer for tubot-sf-data360.
+ * Cloudflare KV TTL caching layer for tubot-sf-data360.
  *
  * Cached values are non-secret operational hints only (catalog payloads,
  * last-good snapshots, channel-map resolutions). Tokens, secrets, and PII
  * must never be cached through this module.
  *
- * The layer never throws: any error, or an unavailable Cache API (plain
- * Bun/Node runtimes), degrades to null (get) or no-op (put/delete).
+ * Backend accounting: Cache API match/put/delete calls count against the
+ * Worker 50-subrequest invocation budget and 502 cold runs, so the TTL
+ * cache uses KV instead. KV operations count against the separate 1,000
+ * internal-services budget.
+ *
+ * The binding is installed once per request entry via initCache(). The
+ * layer never throws: any error, or an uninitialized binding (plain
+ * Bun/Node runtimes, missing env), degrades to null (get) or no-op
+ * (put/delete).
  */
 
 export const CACHE_TTL = {
@@ -28,50 +35,29 @@ export function channelMapCacheKey(orgId: string, identifier: string): string {
 }
 
 const KEY_PATTERN = /^[A-Za-z0-9/_.-]+$/;
-const CACHE_BASE_URL = "https://cache.internal/v1/";
 
-interface EdgeCacheLike {
-  match(request: Request): Promise<Response | undefined>;
-  put(request: Request, response: Response): Promise<void>;
-  delete(request: Request): Promise<boolean>;
-}
+let kvBinding: KVNamespace | null = null;
 
-function getDefaultCache(): EdgeCacheLike | null {
-  try {
-    const cachesStore = (
-      globalThis as unknown as { caches?: { default?: EdgeCacheLike } }
-    ).caches;
-    const cache = cachesStore?.default;
-    if (!cache) return null;
-    if (
-      typeof cache.match !== "function" ||
-      typeof cache.put !== "function" ||
-      typeof cache.delete !== "function"
-    ) {
-      return null;
-    }
-    return cache;
-  } catch {
-    return null;
-  }
+/**
+ * Installs the KV namespace backing this module. Safe to call once per
+ * request entry: the binding value is identical for every request of a
+ * worker+env. Pass null/undefined to uninstall (tests, teardown).
+ */
+export function initCache(kv: KVNamespace | null | undefined): void {
+  kvBinding = kv ?? null;
 }
 
 function isValidKey(key: string): boolean {
   return typeof key === "string" && KEY_PATTERN.test(key);
 }
 
-function cacheRequestFor(key: string): Request {
-  return new Request(`${CACHE_BASE_URL}${key}`);
-}
-
 export async function cacheGetJSON<T>(key: string): Promise<T | null> {
   try {
     if (!isValidKey(key)) return null;
-    const cache = getDefaultCache();
-    if (!cache) return null;
-    const res = await cache.match(cacheRequestFor(key));
-    if (!res) return null;
-    return (await res.json()) as T;
+    if (!kvBinding) return null;
+    const value = await kvBinding.get(key, "json");
+    if (value === null || value === undefined) return null;
+    return value as T;
   } catch {
     return null;
   }
@@ -84,12 +70,10 @@ export async function cachePutJSON(
 ): Promise<void> {
   try {
     if (!isValidKey(key)) return;
-    const cache = getDefaultCache();
-    if (!cache) return;
-    const res = Response.json(value, {
-      headers: { "Cache-Control": `max-age=${ttlSeconds}` },
+    if (!kvBinding) return;
+    await kvBinding.put(key, JSON.stringify(value), {
+      expirationTtl: ttlSeconds,
     });
-    await cache.put(cacheRequestFor(key), res);
   } catch {
     // Degrade to no-op.
   }
@@ -98,9 +82,8 @@ export async function cachePutJSON(
 export async function cacheDelete(key: string): Promise<void> {
   try {
     if (!isValidKey(key)) return;
-    const cache = getDefaultCache();
-    if (!cache) return;
-    await cache.delete(cacheRequestFor(key));
+    if (!kvBinding) return;
+    await kvBinding.delete(key);
   } catch {
     // Degrade to no-op.
   }

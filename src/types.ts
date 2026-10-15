@@ -20,6 +20,7 @@ export interface Data360Env {
     fetch?(input: any, init?: any): Promise<Response>;
   };
   DB?: D1Database;
+  DATA360_KV?: KVNamespace;
   DATA360_INTERNAL_KEY?: string;
   DATA360_INTERNAL_KEY_NEXT?: string;
   SF_CREDENTIAL_ENCRYPTION_KEY?: string;
