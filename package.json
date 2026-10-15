@@ -7,8 +7,9 @@
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
 		"test": "bun test",
-		"verify:live": "bun run scripts/verify-export.ts",
-		"cf-typegen": "wrangler types"
+		"verify:live": "bash scripts/data-cloud/test.sh",
+		"cf-typegen": "wrangler types",
+		"seed:live": "bash scripts/data-cloud/seed.sh"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-plugin": "^1.0.0",

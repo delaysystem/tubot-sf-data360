@@ -14,6 +14,7 @@ import type {
 import { SalesforceBatchClient } from "./batch-client";
 import { AgentAnalyzer } from "./agent-analyzer";
 import { ZipBuilder } from "./zip-builder";
+import { DataCloudClient } from "./data-cloud-client";
 import { UnstructuredExtractor } from "./unstructured-extractor";
 import { B2CacheManager } from "./b2-cache-manager";
 import { getAgentScripts, getCallableToolUrlsForChannel } from "../../tubot-sf-auth/src/agent-script";
@@ -109,47 +110,29 @@ export class Data360Extractor {
       agentArtifacts.promptTemplates
     );
 
-    // Discover ALL DMOs, DLOs, CIOs, and UDMOs in the org via SObjects describe
-    const allDmoNames: string[] = [...discovered.dmoNames];
-    try {
-      const sobjRes = await fetch(`${conn.instanceUrl}/services/data/${apiVersion}/sobjects`, {
-        headers: {
-          Authorization: `Bearer ${conn.accessToken}`,
-          Accept: "application/json",
-        },
-      });
-      if (sobjRes.ok) {
-        const sobjData = (await sobjRes.json()) as any;
-        const orgDmos = (sobjData?.sobjects || [])
-          .map((s: any) => s.name as string)
-          .filter(
-            (name: string) =>
-              name.endsWith("__dlm") ||
-              name.endsWith("__dll") ||
-              name.endsWith("__cio") ||
-              name.endsWith("__udmo")
-          );
-        for (const dmo of orgDmos) {
-          if (!allDmoNames.includes(dmo)) {
-            allDmoNames.push(dmo);
-          }
-        }
-      }
-    } catch (err: unknown) {
-      warnings.push(`SObjects catalog discovery skipped: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    const dataCloudClient = new DataCloudClient(conn, apiVersion);
+    const catalog = options.includeMetadata !== false || options.includeDataCloudRecords !== false
+      ? await dataCloudClient.discover()
+      : { dataSpaces: [], objects: [], identityResolutions: [], warnings: [] };
+    warnings.push(...catalog.warnings);
+    const models = catalog.objects.filter(o => ["dmo", "unified-dmo", "link-dmo", "udmo"].includes(o.family));
+    const allDmoNames = [...new Set(models.map(o => o.name))];
 
     // Step 4: Batched Metadata Retrieval
     const metadata: Data360Metadata = {
       channel: channelRecord,
-      dataSpaces: [],
+      dataSpaces: options.includeMetadata !== false ? catalog.dataSpaces : [],
       dataStreams: [],
       dataLakeMappings: [],
       marketSegments: [],
-      calculatedInsights: [],
-      identityResolutionRules: [],
-      dmoDescribes: {},
-      dmoCatalog: allDmoNames.map((name) => ({ name })),
+      calculatedInsights: catalog.objects.filter(o => o.family === "calculated-insight").map(o => o.metadata),
+      dataLakeObjects: catalog.objects.filter(o => o.family === "dlo").map(o => o.metadata),
+      dataModelObjects: models.map(o => o.metadata),
+      dataGraphs: catalog.objects.filter(o => o.family === "data-graph").map(o => o.metadata),
+      dataCloudObjects: catalog.objects,
+      identityResolutionRules: catalog.identityResolutions,
+      dmoDescribes: Object.fromEntries(models.filter(o => o.metadata.isEnabled !== false).map(o => [o.storageKey, o.metadata])),
+      dmoCatalog: models.map(({ name, dataSpace, family, storageKey }) => ({ name, dataSpace, family, storageKey })),
     };
 
     if (options.includeMetadata !== false) {
@@ -167,17 +150,17 @@ export class Data360Extractor {
         // 2: CalculatedInsight
         {
           method: "GET",
-          url: `${apiVersion}/query?q=${encodeURIComponent("SELECT Id, Name, Description, Status, CreatedDate FROM CalculatedInsight LIMIT 50")}`,
+          url: `${apiVersion}/query?q=${encodeURIComponent("SELECT Id, Name, CalculatedInsightStatus, LastRunStatus FROM MktCalculatedInsight LIMIT 50")}`,
         },
         // 3: IdentityResolutionRuleset
         {
           method: "GET",
-          url: `${apiVersion}/query?q=${encodeURIComponent("SELECT Id, Name, Description, CreatedDate FROM IdentityResolutionRuleset LIMIT 50")}`,
+          url: `${apiVersion}/query?q=${encodeURIComponent("SELECT Id, Name, Status, LastRunStatus FROM IdentityResolution LIMIT 50")}`,
         },
         // 4: DataStream
         {
           method: "GET",
-          url: `${apiVersion}/query?q=${encodeURIComponent("SELECT Id, Name, Status, SourceType, DataSpaceId, CreatedDate FROM DataStream LIMIT 50")}`,
+          url: `${apiVersion}/query?q=${encodeURIComponent("SELECT Id, Name, DataStreamStatus, StreamType, ImportRunStatus FROM DataStream LIMIT 50")}`,
         },
         // 5: MktDataLakeMapping
         {
@@ -185,14 +168,6 @@ export class Data360Extractor {
           url: `${apiVersion}/query?q=${encodeURIComponent("SELECT Id, Name, SourceObject, TargetObject FROM MktDataLakeMapping LIMIT 50")}`,
         },
       ];
-
-      // DMO Describes for ALL discovered DMOs
-      for (const dmo of allDmoNames) {
-        metadataSubrequests.push({
-          method: "GET",
-          url: `${apiVersion}/sobjects/${dmo}/describe`,
-        });
-      }
 
       totalSubrequests += metadataSubrequests.length;
       totalBatchRequests += Math.ceil(metadataSubrequests.length / SalesforceBatchClient.MAX_BATCH_SIZE);
@@ -207,11 +182,6 @@ export class Data360Extractor {
       // Process MarketSegment
       if (metaResponses[1]?.statusCode === 200 && Array.isArray(metaResponses[1].result?.records)) {
         metadata.marketSegments = metaResponses[1].result.records;
-      }
-
-      // Process CalculatedInsight
-      if (metaResponses[2]?.statusCode === 200 && Array.isArray(metaResponses[2].result?.records)) {
-        metadata.calculatedInsights = metaResponses[2].result.records;
       }
 
       // Process IdentityResolutionRuleset
@@ -229,14 +199,6 @@ export class Data360Extractor {
         metadata.dataLakeMappings = metaResponses[5].result.records;
       }
 
-      // Process DMO Describes
-      allDmoNames.forEach((dmoName, idx) => {
-        const respIdx = 6 + idx;
-        const resp = metaResponses[respIdx];
-        if (resp && resp.statusCode >= 200 && resp.statusCode < 300 && resp.result) {
-          metadata.dmoDescribes[dmoName] = resp.result;
-        }
-      });
     }
 
     // Step 5: Batched Customer 360 Records Retrieval
@@ -276,7 +238,7 @@ export class Data360Extractor {
         // 3: Order
         {
           method: "GET",
-          url: `${apiVersion}/query?q=${encodeURIComponent(`SELECT Id, AccountId, Status, TotalAmount, EffectiveDate, CreatedDate FROM Order WHERE Account.Name LIKE 'D360 %' OR CreatedDate >= LAST_N_DAYS:365 LIMIT ${maxRecords}`)}`,
+          url: `${apiVersion}/query?q=${encodeURIComponent(`SELECT Id, AccountId, Status, TotalAmount, EffectiveDate, CreatedDate FROM Order LIMIT ${maxRecords}`)}`,
         },
         // 4: OrderItem
         {
@@ -286,12 +248,12 @@ export class Data360Extractor {
         // 5: Lead
         {
           method: "GET",
-          url: `${apiVersion}/query?q=${encodeURIComponent(`SELECT Id, Name, Company, Email, Phone, City, Country, Status, CreatedDate FROM Lead WHERE Company = 'Data 360 Marketing Test' OR CreatedDate >= LAST_N_DAYS:365 LIMIT ${maxRecords}`)}`,
+          url: `${apiVersion}/query?q=${encodeURIComponent(`SELECT Id, Name, Company, Email, Phone, City, Country, Status, CreatedDate FROM Lead LIMIT ${maxRecords}`)}`,
         },
         // 6: Account
         {
           method: "GET",
-          url: `${apiVersion}/query?q=${encodeURIComponent(`SELECT Id, Name, Type, Phone, CreatedDate FROM Account WHERE Name LIKE 'D360 %' LIMIT ${maxRecords}`)}`,
+          url: `${apiVersion}/query?q=${encodeURIComponent(`SELECT Id, Name, Type, Phone, CreatedDate FROM Account LIMIT ${maxRecords}`)}`,
         },
         // 7: MessagingSession (if channel filter available)
         {
@@ -319,30 +281,12 @@ export class Data360Extractor {
       if (crmResponses[7]?.statusCode === 200) records.crm.messagingSessions = crmResponses[7].result?.records || [];
     }
 
-    // Step 6: Data Cloud SQL Query API (where available)
-    if (options.includeDataCloudRecords !== false && allDmoNames.length > 0) {
-      for (const dmo of allDmoNames.slice(0, 8)) {
-        try {
-          const sqlRes = await fetch(`${conn.instanceUrl}/services/data/${apiVersion}/ssot/queryv2`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${conn.accessToken}`,
-              "Content-Type": "application/json",
-              Accept: "application/json",
-            },
-            body: JSON.stringify({
-              sql: `SELECT * FROM ${dmo} LIMIT 200`,
-            }),
-          });
-
-          if (sqlRes.ok) {
-            const sqlData = (await sqlRes.json()) as any;
-            if (Array.isArray(sqlData?.data)) {
-              records.dataCloud[dmo] = sqlData.data;
-            }
-          }
-        } catch {}
-      }
+    // Data 360 retrieval is owned by the worker, including B2-bound snapshots.
+    if (options.includeDataCloudRecords !== false) {
+      const retrieved = await dataCloudClient.retrieve(catalog.objects, discovered.dmoNames, maxRecords);
+      records.dataCloud = retrieved.dataCloud;
+      records.dataGraphs = retrieved.dataGraphs;
+      warnings.push(...retrieved.warnings);
     }
 
     // Step 7: Unstructured Files Extraction (PDF, images, documents, text, static resources)
@@ -387,7 +331,7 @@ export class Data360Extractor {
     };
 
     const manifest: ExportManifest = {
-      version: "1.0.0",
+      version: "2.0.0",
       exportTimestamp: new Date().toISOString(),
       target: {
         channelId: options.channelId,
@@ -416,6 +360,7 @@ export class Data360Extractor {
           accounts: records.crm.accounts.length,
           messagingSessions: records.crm.messagingSessions.length,
         },
+        dataGraphRecordCounts: Object.fromEntries(Object.entries(records.dataGraphs ?? {}).map(([name, rows]) => [name, rows.length])),
         dataCloudRecordCounts: Object.fromEntries(
           Object.entries(records.dataCloud).map(([k, v]) => [k, v.length])
         ),
@@ -450,7 +395,7 @@ export class Data360Extractor {
         pkg.b2Cache = b2Meta;
         manifest.b2Cache = b2Meta;
       } catch (err: unknown) {
-        warnings.push(`B2 Cache storage encountered an issue: ${err instanceof Error ? err.message : String(err)}`);
+        throw new Error(`B2 snapshot storage failed: ${err instanceof Error ? err.message : "upstream storage error"}`);
       }
     }
 

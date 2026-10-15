@@ -10,10 +10,13 @@ import type {
   MessagingSessionData360Result,
   CorrespondingDataOptions,
   CorrespondingDataResult,
+  DataCloudFamily,
 } from "./types";
-import { SalesforceAuthBridge } from "./auth-client";
+import { DATA_CLOUD_FAMILIES } from "./types";
+import { SalesforceAuthBridge, SalesforceAuthorizationError } from "./auth-client";
 import { Data360Extractor } from "./data360-extractor";
 import { B2CacheManager } from "./b2-cache-manager";
+import { claimServiceNonce, readSigHeaders, verifyServiceSignature } from "./service-verify";
 import {
   D1Data360Cache,
   purgeEdgeCache,
@@ -35,7 +38,7 @@ export { B2CacheManager, type B2FileEntry, type B2ClientInterface } from "./b2-c
 export * from "./data360-extractor";
 export * from "./cache-helper";
 
-let BaseWorkerEntrypoint: any = class {
+let BaseWorkerEntrypoint: abstract new (ctx: any, env: any) => any = class {
   constructor(public ctx: any, public env: any) {}
 };
 try {
@@ -81,35 +84,38 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: returns the latest cached snapshot summary from B2.
    */
-  async getLatestCache(options: { orgId?: string; channelId?: string; agentName?: string }): Promise<any> {
+  async getLatestCache(options: ExportData360Options): Promise<any> {
     const b2CacheManager = createB2CacheManager(this.env);
     const targetId = options.channelId || options.agentName || "data360";
-    const orgId = options.orgId || targetId;
+    const orgId = (await new SalesforceAuthBridge(this.env).resolveToken(options)).connection.orgId!;
     return b2CacheManager.getLatestSnapshot(orgId, targetId);
   }
 
   /**
    * RPC method: queries cached DMOs, CRM entities, or files from B2.
    */
-  async queryCache(options: {
+  async queryCache(options: ExportData360Options & {
     orgId?: string;
     channelId?: string;
     agentName?: string;
     dmo?: string;
+    objectType?: DataCloudFamily;
+    objectName?: string;
+    dataSpace?: string;
     crmEntity?: string;
     file?: string;
     snapshotId?: string;
   }): Promise<any> {
     const b2CacheManager = createB2CacheManager(this.env);
     const targetId = options.channelId || options.agentName || "data360";
-    const orgId = options.orgId || targetId;
+    const orgId = (await new SalesforceAuthBridge(this.env).resolveToken(options)).connection.orgId!;
     return b2CacheManager.queryCachedEntity(orgId, targetId, options);
   }
 
   /**
    * RPC method: streams cached ZIP file bytes directly from B2.
    */
-  async downloadCachedZip(options: {
+  async downloadCachedZip(options: ExportData360Options & {
     orgId?: string;
     channelId?: string;
     agentName?: string;
@@ -117,17 +123,17 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   }): Promise<Uint8Array | null> {
     const b2CacheManager = createB2CacheManager(this.env);
     const targetId = options.channelId || options.agentName || "data360";
-    const orgId = options.orgId || targetId;
+    const orgId = (await new SalesforceAuthBridge(this.env).resolveToken(options)).connection.orgId!;
     return b2CacheManager.downloadCachedZip(orgId, targetId, options.snapshotId);
   }
 
   /**
    * RPC method: lists snapshot summaries for a given target from B2.
    */
-  async listSnapshots(options: { orgId?: string; channelId?: string; agentName?: string }): Promise<any[]> {
+  async listSnapshots(options: ExportData360Options): Promise<any[]> {
     const b2CacheManager = createB2CacheManager(this.env);
     const targetId = options.channelId || options.agentName || "data360";
-    const orgId = options.orgId || targetId;
+    const orgId = (await new SalesforceAuthBridge(this.env).resolveToken(options)).connection.orgId!;
     return b2CacheManager.listSnapshots(orgId, targetId);
   }
 
@@ -431,7 +437,7 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
     return {
       ok: true,
       userId,
-      channelId,
+      channelId: channelId ?? "",
       sessionId,
       compositeETag,
       cacheBreakdown: {
@@ -990,6 +996,27 @@ export default {
     try {
       const url = new URL(request.url);
       const path = url.pathname;
+
+      // B2 credentials never authorize an HTTP caller. Resolve its Salesforce
+      // identity before selecting an organization storage prefix.
+      if (/^\/(api\/)?cache\/(latest|query|download|snapshots)$/.test(path)) {
+        const authorization = request.headers.get("authorization") ?? "";
+        const instanceUrl = request.headers.get("x-salesforce-instance-url");
+        if (!/^Bearer\s+\S+/i.test(authorization) || !instanceUrl) return Response.json({ error: "unauthorized" }, { status: 401 });
+        try {
+          const auth = await new SalesforceAuthBridge(env).resolveToken({
+            accessToken: authorization, instanceUrl,
+            orgId: url.searchParams.get("orgId") ?? request.headers.get("x-org-id") ?? undefined,
+          });
+          url.searchParams.set("orgId", auth.connection.orgId!);
+        } catch (error) {
+          return Response.json({ error: error instanceof SalesforceAuthorizationError && error.status === 403 ? "forbidden" : "unauthorized" }, { status: error instanceof SalesforceAuthorizationError ? error.status : 401 });
+        }
+        for (const parameter of ["channelId", "agentName", "snapshotId"]) {
+          const value = url.searchParams.get(parameter);
+          if (value !== null && !/^[A-Za-z0-9_-]+$/.test(value)) return Response.json({ error: "invalid_request", message: "Invalid cache scope." }, { status: 400 });
+        }
+      }
 
     // Health Check
     if (path === "/health" || (path === "/" && request.method === "GET")) {
@@ -1776,19 +1803,46 @@ export default {
     if (path === "/export" || path === "/api/export" || path === "/cache/refresh" || path === "/api/cache/refresh") {
       const isRefresh = path === "/cache/refresh" || path === "/api/cache/refresh";
 
-      // Internal gate: ONLY /cache/refresh requires the shared data360 secret.
-      // /export behavior is unchanged.
+      // Internal gate: ONLY /cache/refresh is authenticated, via HMAC-signed
+      // service requests (see panel worker/service-signer.ts). /export behavior
+      // is unchanged. TRANSITION: a legacy x-data360-secret bearer is still
+      // accepted while callers migrate; it is removed at cutover.
+      let refreshRawBody: string | null = null;
       if (isRefresh) {
         if (request.method !== "POST") {
           return Response.json({ error: "method_not_allowed" }, { status: 405 });
         }
-        const expectedSecret = env.DATA360_INTERNAL_KEY;
-        if (!expectedSecret) {
+        const keys = [env.DATA360_INTERNAL_KEY, env.DATA360_INTERNAL_KEY_NEXT].filter(
+          (k): k is string => typeof k === "string" && k.length >= 32,
+        );
+        if (keys.length === 0) {
           return Response.json({ error: "data360_unconfigured" }, { status: 503 });
         }
-        const providedSecret = request.headers.get("x-data360-secret");
-        if (!providedSecret || !timingSafeEqual(providedSecret, expectedSecret)) {
-          return Response.json({ error: "unauthorized" }, { status: 401 });
+        refreshRawBody = await request.text();
+        if (refreshRawBody.length > 65536) {
+          return Response.json({ error: "invalid_request", message: "Body too large." }, { status: 413 });
+        }
+        const nowSec = Math.floor(Date.now() / 1000);
+        const sig = readSigHeaders(request.headers);
+        if (sig) {
+          // Signed requests require replay protection; without a D1 binding
+          // there is no nonce store, so fail closed instead of skipping it.
+          if (!env.DB) {
+            return Response.json({ error: "data360_unconfigured" }, { status: 503 });
+          }
+          const ok =
+            (await verifyServiceSignature(keys, request.method, path, refreshRawBody, sig, nowSec)) &&
+            (await claimServiceNonce(env.DB, sig.nonce, nowSec));
+          if (!ok) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
+        } else {
+          const providedSecret = request.headers.get("x-data360-secret");
+          const legacyOk =
+            !!providedSecret && keys.some((k) => timingSafeEqual(providedSecret, k));
+          if (!legacyOk) {
+            return Response.json({ error: "unauthorized" }, { status: 401 });
+          }
         }
       }
 
@@ -1799,7 +1853,10 @@ export default {
           const contentType = request.headers.get("content-type") || "";
           if (contentType.includes("application/json")) {
             try {
-              options = (await request.json()) as ExportData360Options;
+              // Refresh bodies were already consumed as text by the HMAC gate.
+              options = (isRefresh && refreshRawBody !== null
+                ? JSON.parse(refreshRawBody)
+                : await request.json()) as ExportData360Options;
             } catch {
               return Response.json({ error: "invalid_json", message: "Malformed JSON body." }, { status: 400 });
             }
@@ -1831,6 +1888,7 @@ export default {
         // refresh snapshots carry records+metadata, file bytes stay in /export.
         if (isRefresh) {
           options.cacheToB2 = true;
+          options.format = "json";
           options.includeUnstructuredFiles = false;
         }
 
@@ -1967,6 +2025,7 @@ export default {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         const isClientError = msg.includes("must be specified") || msg.includes("cannot be empty");
+        if (err instanceof SalesforceAuthorizationError) return Response.json({ error: err.status === 403 ? "forbidden" : "unauthorized" }, { status: err.status });
         return Response.json(
           {
             error: isClientError ? "invalid_request" : "export_failed",
@@ -2035,6 +2094,12 @@ export default {
         const orgId = url.searchParams.get("orgId") || request.headers.get("x-org-id") || targetId;
 
         const dmo = url.searchParams.get("dmo") || undefined;
+        const objectType = url.searchParams.get("objectType") || undefined;
+        const objectName = url.searchParams.get("objectName") || undefined;
+        const dataSpace = url.searchParams.get("dataSpace") || undefined;
+        if (objectType && !DATA_CLOUD_FAMILIES.includes(objectType as DataCloudFamily)) {
+          return Response.json({ error: "invalid_request", message: "Unknown Data 360 objectType." }, { status: 400 });
+        }
         const crmEntity = url.searchParams.get("crmEntity") || undefined;
         const file = url.searchParams.get("file") || undefined;
         const snapshotId = url.searchParams.get("snapshotId") || undefined;
@@ -2042,6 +2107,9 @@ export default {
         const cacheMgr = createB2CacheManager(env);
         const data = await cacheMgr.queryCachedEntity(orgId, targetId, {
           dmo,
+          objectType: objectType as DataCloudFamily | undefined,
+          objectName,
+          dataSpace,
           crmEntity,
           file,
           snapshotId,

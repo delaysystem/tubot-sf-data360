@@ -1,3 +1,4 @@
+import { connectApiCoverageResponse } from "./helpers/connect-api";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { unzipSync, strFromU8 } from "fflate";
 import worker from "../src/index";
@@ -27,6 +28,8 @@ describe("tubot-sf-data360 export pipeline", () => {
     // Setup Mock Salesforce Responses
     globalThis.fetch = vi.fn().mockImplementation(async (url: string, init?: any) => {
       const urlStr = String(url);
+      const catalogResponse = connectApiCoverageResponse(urlStr);
+      if (catalogResponse) return catalogResponse;
 
       // SOAP Metadata Retrieve (initiate & poll)
       if (urlStr.includes("/services/Soap/m/")) {
@@ -132,6 +135,7 @@ describe("tubot-sf-data360 export pipeline", () => {
     });
 
     const env: Data360Env = {
+      SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
       TUBOT_SF_AUTH: {
         getTokenForChannel: vi.fn().mockResolvedValue({
           accessToken: "mock-test-token",
@@ -178,7 +182,9 @@ describe("tubot-sf-data360 export pipeline", () => {
 
   it("POST /export with format=json returns raw JSON payload", async () => {
     globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
-      if (url.includes("/composite/batch")) {
+      const catalogResponse = connectApiCoverageResponse(String(url));
+      if (catalogResponse) return catalogResponse;
+      if (String(url).includes("/composite/batch")) {
         return Response.json({
           hasErrors: false,
           results: [{ statusCode: 200, result: { records: [] } }],
@@ -188,6 +194,7 @@ describe("tubot-sf-data360 export pipeline", () => {
     });
 
     const env: Data360Env = {
+      SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
       TUBOT_SF_AUTH: {
         getTokenForChannel: vi.fn().mockResolvedValue({
           accessToken: "mock-test-token",
@@ -236,6 +243,8 @@ describe("tubot-sf-data360 export pipeline", () => {
 
     globalThis.fetch = vi.fn().mockImplementation(async (url: string, init?: any) => {
       const urlStr = String(url);
+      const catalogResponse = connectApiCoverageResponse(urlStr);
+      if (catalogResponse) return catalogResponse;
 
       if (urlStr.includes("b2_authorize_account")) {
         return Response.json({
@@ -278,6 +287,7 @@ describe("tubot-sf-data360 export pipeline", () => {
       BACKBLAZE_APPLICATION_KEY: "test-app-key",
       BACKBLAZE_BUCKET_ID: "tubot-encrypted",
       BACKBLAZE_ENDPOINT: "s3.us-west-004.backblazeb2.com",
+      SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
       TUBOT_SF_AUTH: {
         getTokenForChannel: vi.fn().mockResolvedValue({
           accessToken: "mock-test-token",
@@ -315,6 +325,8 @@ describe("tubot-sf-data360 export pipeline", () => {
   it("POST /cache/refresh triggers extraction with enforced cacheToB2 and returns summary", async () => {
     globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
       const urlStr = String(url);
+      const catalogResponse = connectApiCoverageResponse(urlStr);
+      if (catalogResponse) return catalogResponse;
       if (urlStr.includes("b2_authorize_account")) {
         return Response.json({
           authorizationToken: "auth-123",
@@ -350,11 +362,12 @@ describe("tubot-sf-data360 export pipeline", () => {
     });
 
     const env: Data360Env = {
-      DATA360_INTERNAL_KEY: "test-internal-secret",
+      DATA360_INTERNAL_KEY: "test-internal-secret-0123456789abcdef",
       BACKBLAZE_KEY_ID: "test-key-id",
       BACKBLAZE_APPLICATION_KEY: "test-app-key",
       BACKBLAZE_BUCKET_ID: "tubot-encrypted",
       BACKBLAZE_ENDPOINT: "s3.us-west-004.backblazeb2.com",
+      SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
       TUBOT_SF_AUTH: {
         getTokenForChannel: vi.fn().mockResolvedValue({
           accessToken: "mock-test-token",
@@ -367,7 +380,7 @@ describe("tubot-sf-data360 export pipeline", () => {
 
     const req = new Request("https://data360.internal/cache/refresh", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-data360-secret": "test-internal-secret" },
+      headers: { "Content-Type": "application/json", "x-data360-secret": "test-internal-secret-0123456789abcdef" },
       body: JSON.stringify({
         agentName: "DATA360TEST",
         teamId: "team-1",

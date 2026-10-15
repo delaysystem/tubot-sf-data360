@@ -120,16 +120,6 @@ export class AgentAnalyzer {
     const actions = new Set<string>();
     const promptTemplateNames = new Set<string>();
 
-    // Standard Data 360 Core DMOs
-    const defaultCoreDmos = [
-      "ssot__Individual__dlm",
-      "ssot__ContactPointEmail__dlm",
-      "ssot__ContactPointPhone__dlm",
-      "ssot__SalesOrder__dlm",
-      "ssot__SalesOrderProduct__dlm",
-    ];
-    defaultCoreDmos.forEach((d) => dmoNames.add(d));
-
     if (!script) {
       return {
         dmoNames: Array.from(dmoNames),
@@ -141,7 +131,7 @@ export class AgentAnalyzer {
     }
 
     // 1. Discover DMOs via regex: ssot__*__dlm, *__dlm, *__dlo
-    const dmoMatches = script.matchAll(/\b([a-zA-Z0-9_]+__(?:dlm|dlo))\b/g);
+    const dmoMatches = script.matchAll(/\b([a-zA-Z0-9_]+__(?:dlm|dll|dlo|cio|udmo))\b/g);
     for (const match of dmoMatches) {
       if (match[1]) dmoNames.add(match[1]);
     }

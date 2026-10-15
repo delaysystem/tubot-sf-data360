@@ -5,11 +5,14 @@ import type { Data360Env } from "../src/types";
 describe("tubot-sf-data360 worker endpoints", () => {
   let originalFetch: typeof fetch;
 
+  const cacheHeaders = { Authorization: "Bearer package-coverage-token", "x-salesforce-instance-url": "https://test.my.salesforce.com" };
+
   const mockEnv: Data360Env = {
     BACKBLAZE_KEY_ID: "test-key-id",
     BACKBLAZE_APPLICATION_KEY: "test-app-key",
     BACKBLAZE_BUCKET_ID: "tubot-encrypted",
     BACKBLAZE_ENDPOINT: "s3.us-west-004.backblazeb2.com",
+    SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
     TUBOT_SF_AUTH: {
       getTokenForChannel: vi.fn().mockResolvedValue({
         accessToken: "mock-test-token",
@@ -21,6 +24,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async () => Response.json({ organization_id: "00D000000000001AAA" }));
   });
 
   afterEach(() => {
@@ -75,7 +79,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
   describe("GET /cache/latest", () => {
     it("returns 400 if neither channelId nor agentName is provided", async () => {
-      const response = await worker.fetch(new Request("https://example.com/cache/latest"), mockEnv);
+      const response = await worker.fetch(new Request("https://example.com/cache/latest", { headers: cacheHeaders }), mockEnv);
       expect(response.status).toBe(400);
       const data = (await response.json()) as any;
       expect(data.error).toBe("invalid_request");
@@ -84,6 +88,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
     it("returns 404 when no snapshot exists", async () => {
       globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
         const urlStr = String(url);
+        if (urlStr.endsWith("/services/oauth2/userinfo")) return Response.json({ organization_id: "00D000000000001AAA" });
         if (urlStr.includes("b2_authorize_account")) {
           return Response.json({
             authorizationToken: "auth-123",
@@ -103,7 +108,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
       });
 
       const response = await worker.fetch(
-        new Request("https://example.com/cache/latest?channelId=chan123&orgId=org123"),
+        new Request("https://example.com/cache/latest?channelId=chan123&orgId=00D000000000001AAA", { headers: cacheHeaders }),
         mockEnv
       );
       expect(response.status).toBe(404);
@@ -115,7 +120,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
       const mockSummary = {
         snapshotId: "2026-09-25T16-00-00",
         targetIdentifier: "chan123",
-        orgId: "org123",
+        orgId: "00D000000000001AAA",
         createdTimestamp: "2026-09-25T16:00:00Z",
         recordCounts: { dmoRecords: 10, crmRecords: 5 },
         unstructuredFileCount: 2,
@@ -124,6 +129,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
       globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
         const urlStr = String(url);
+        if (urlStr.endsWith("/services/oauth2/userinfo")) return Response.json({ organization_id: "00D000000000001AAA" });
         if (urlStr.includes("b2_authorize_account")) {
           return Response.json({
             authorizationToken: "auth-123",
@@ -143,7 +149,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
       });
 
       const response = await worker.fetch(
-        new Request("https://example.com/cache/latest?channelId=chan123&orgId=org123"),
+        new Request("https://example.com/cache/latest?channelId=chan123&orgId=00D000000000001AAA", { headers: cacheHeaders }),
         mockEnv
       );
       expect(response.status).toBe(200);
@@ -157,7 +163,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
   describe("GET /cache/query", () => {
     it("returns 400 when channelId or agentName is omitted", async () => {
-      const response = await worker.fetch(new Request("https://example.com/cache/query?dmo=Account__dlm"), mockEnv);
+      const response = await worker.fetch(new Request("https://example.com/cache/query?dmo=Account__dlm", { headers: cacheHeaders }), mockEnv);
       expect(response.status).toBe(400);
       const data = (await response.json()) as any;
       expect(data.error).toBe("invalid_request");
@@ -169,6 +175,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
       globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
         const urlStr = String(url);
+        if (urlStr.endsWith("/services/oauth2/userinfo")) return Response.json({ organization_id: "00D000000000001AAA" });
         if (urlStr.includes("b2_authorize_account")) {
           return Response.json({
             authorizationToken: "auth-123",
@@ -191,7 +198,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
       });
 
       const response = await worker.fetch(
-        new Request("https://example.com/cache/query?agentName=TestAgent&dmo=Account__dlm"),
+        new Request("https://example.com/cache/query?agentName=TestAgent&dmo=Account__dlm", { headers: cacheHeaders }),
         mockEnv
       );
       expect(response.status).toBe(200);
@@ -206,6 +213,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
       globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
         const urlStr = String(url);
+        if (urlStr.endsWith("/services/oauth2/userinfo")) return Response.json({ organization_id: "00D000000000001AAA" });
         if (urlStr.includes("b2_authorize_account")) {
           return Response.json({
             authorizationToken: "auth-123",
@@ -228,7 +236,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
       });
 
       const response = await worker.fetch(
-        new Request("https://example.com/cache/query?agentName=TestAgent&file=document.pdf"),
+        new Request("https://example.com/cache/query?agentName=TestAgent&file=document.pdf", { headers: cacheHeaders }),
         mockEnv
       );
       expect(response.status).toBe(200);
@@ -241,7 +249,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
   describe("GET /cache/download", () => {
     it("returns 400 when channelId or agentName is omitted", async () => {
-      const response = await worker.fetch(new Request("https://example.com/cache/download"), mockEnv);
+      const response = await worker.fetch(new Request("https://example.com/cache/download", { headers: cacheHeaders }), mockEnv);
       expect(response.status).toBe(400);
       const data = (await response.json()) as any;
       expect(data.error).toBe("invalid_request");
@@ -253,6 +261,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
       globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
         const urlStr = String(url);
+        if (urlStr.endsWith("/services/oauth2/userinfo")) return Response.json({ organization_id: "00D000000000001AAA" });
         if (urlStr.includes("b2_authorize_account")) {
           return Response.json({
             authorizationToken: "auth-123",
@@ -275,7 +284,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
       });
 
       const response = await worker.fetch(
-        new Request("https://example.com/cache/download?agentName=TestAgent"),
+        new Request("https://example.com/cache/download?agentName=TestAgent", { headers: cacheHeaders }),
         mockEnv
       );
       expect(response.status).toBe(200);
@@ -289,6 +298,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
     it("returns 404 when cached zip does not exist", async () => {
       globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
         const urlStr = String(url);
+        if (urlStr.endsWith("/services/oauth2/userinfo")) return Response.json({ organization_id: "00D000000000001AAA" });
         if (urlStr.includes("b2_authorize_account")) {
           return Response.json({
             authorizationToken: "auth-123",
@@ -305,7 +315,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
       });
 
       const response = await worker.fetch(
-        new Request("https://example.com/cache/download?agentName=NonExistent"),
+        new Request("https://example.com/cache/download?agentName=NonExistent", { headers: cacheHeaders }),
         mockEnv
       );
       expect(response.status).toBe(404);
@@ -316,7 +326,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
   describe("GET /cache/snapshots", () => {
     it("returns 400 when channelId or agentName is missing", async () => {
-      const response = await worker.fetch(new Request("https://example.com/cache/snapshots"), mockEnv);
+      const response = await worker.fetch(new Request("https://example.com/cache/snapshots", { headers: cacheHeaders }), mockEnv);
       expect(response.status).toBe(400);
       const data = (await response.json()) as any;
       expect(data.error).toBe("invalid_request");
@@ -325,6 +335,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
     it("lists snapshots successfully", async () => {
       globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
         const urlStr = String(url);
+        if (urlStr.endsWith("/services/oauth2/userinfo")) return Response.json({ organization_id: "00D000000000001AAA" });
         if (urlStr.includes("b2_authorize_account")) {
           return Response.json({
             authorizationToken: "auth-123",
@@ -339,13 +350,13 @@ describe("tubot-sf-data360 worker endpoints", () => {
             files: [
               {
                 fileId: "f1",
-                fileName: "data360/org1/agent1/snapshots/snap-1/manifest.json",
+                fileName: "data360/00D000000000001AAA/agent1/snapshots/snap-1/manifest.json",
                 contentLength: 500,
                 uploadTimestamp: 1600000000000,
               },
               {
                 fileId: "f2",
-                fileName: "data360/org1/agent1/snapshots/snap-2/manifest.json",
+                fileName: "data360/00D000000000001AAA/agent1/snapshots/snap-2/manifest.json",
                 contentLength: 600,
                 uploadTimestamp: 1700000000000,
               },
@@ -366,7 +377,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
       });
 
       const response = await worker.fetch(
-        new Request("https://example.com/cache/snapshots?agentName=agent1&orgId=org1"),
+        new Request("https://example.com/cache/snapshots?agentName=agent1&orgId=00D000000000001AAA", { headers: cacheHeaders }),
         mockEnv
       );
       expect(response.status).toBe(200);
@@ -385,6 +396,7 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
       globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
         const urlStr = String(url);
+        if (urlStr.endsWith("/services/oauth2/userinfo")) return Response.json({ organization_id: "00D000000000001AAA" });
         if (urlStr.includes("b2_authorize_account")) {
           return Response.json({
             authorizationToken: "auth-123",
@@ -409,13 +421,13 @@ describe("tubot-sf-data360 worker endpoints", () => {
         return new Response("Not found", { status: 404 });
       });
 
-      const latest = await entrypoint.getLatestCache({ agentName: "RPCAgent" });
+      const latest = await entrypoint.getLatestCache({ agentName: "RPCAgent", accessToken: "package-coverage-token", instanceUrl: "https://test.my.salesforce.com" });
       expect(latest?.snapshotId).toBe("rpc-snap");
 
-      const zip = await entrypoint.downloadCachedZip({ agentName: "RPCAgent" });
+      const zip = await entrypoint.downloadCachedZip({ agentName: "RPCAgent", accessToken: "package-coverage-token", instanceUrl: "https://test.my.salesforce.com" });
       expect(zip).toEqual(new Uint8Array([1, 2, 3]));
 
-      const snapshots = await entrypoint.listSnapshots({ agentName: "RPCAgent" });
+      const snapshots = await entrypoint.listSnapshots({ agentName: "RPCAgent", accessToken: "package-coverage-token", instanceUrl: "https://test.my.salesforce.com" });
       expect(snapshots).toEqual([]);
     });
   });

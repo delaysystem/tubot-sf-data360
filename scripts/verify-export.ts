@@ -42,7 +42,7 @@ async function main() {
 
   console.log(`  Connected Org:    ${orgDisplay.username} (${orgId})`);
   console.log(`  Instance URL:     ${instanceUrl}`);
-  console.log(`  Access Token:     ${accessToken.slice(0, 15)}...[REDACTED]`);
+  console.log("  Salesforce credentials loaded securely.");
 
   // Step 2: Test worker fetch endpoint
   console.log("\n[2/4] Executing extraction through Worker export endpoint...");

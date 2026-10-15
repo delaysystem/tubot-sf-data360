@@ -356,6 +356,7 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
         BACKBLAZE_KEY_ID: "test-key-id",
         BACKBLAZE_APPLICATION_KEY: "test-app-key",
         BACKBLAZE_BUCKET_ID: "tubot-encrypted",
+        SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
         TUBOT_SF_AUTH: {
           getTokenForChannel: vi.fn().mockResolvedValue({
             accessToken: "mock-test-token",

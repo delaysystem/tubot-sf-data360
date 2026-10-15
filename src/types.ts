@@ -1,3 +1,5 @@
+import type { RpcSignedEnvelope } from "./rpc-sign";
+
 export interface SalesforceConnection {
   instanceUrl: string;
   accessToken: string;
@@ -5,12 +7,13 @@ export interface SalesforceConnection {
 }
 
 export interface Data360Env {
+  SF_AUTH_CALLER_KEY?: string;
   TUBOT_SF_AUTH?: {
-    getTokenForChannel?(channelId: string, options?: { teamId: string; orgId: string }): Promise<any>;
-    getCallableToolUrlsForChannel?(channelId: string, options?: { teamId: string; orgId: string }): Promise<string[]>;
+    getTokenForChannel?(channelId: string, options?: { teamId: string; orgId: string }, signed?: RpcSignedEnvelope): Promise<any>;
+    getCallableToolUrlsForChannel?(channelId: string, options?: { teamId: string; orgId: string }, signed?: RpcSignedEnvelope): Promise<string[]>;
     getUserConversationHistory?(userId: string, options?: {
       teamId: string; orgId: string; channelId?: string; currentSessionId?: string; limit?: number;
-    }): Promise<any>;
+    }, signed?: RpcSignedEnvelope): Promise<any>;
   };
   TUBOT_SF_PARSER?: {
     translateToCel?(content: string, options?: any): Promise<any>;
@@ -18,6 +21,7 @@ export interface Data360Env {
   };
   DB?: D1Database;
   DATA360_INTERNAL_KEY?: string;
+  DATA360_INTERNAL_KEY_NEXT?: string;
   SF_CREDENTIAL_ENCRYPTION_KEY?: string;
   PARSER_SERVICE_URL?: string;
   BACKBLAZE_APPLICATION_KEY?: string;
@@ -231,6 +235,10 @@ export interface ExtractedUnstructuredFile {
 }
 
 export interface Data360Metadata {
+  dataLakeObjects?: any[];
+  dataModelObjects?: any[];
+  dataGraphs?: any[];
+  dataCloudObjects?: DataCloudObject[];
   channel?: Record<string, any>;
   dataSpaces: any[];
   dataStreams?: any[];
@@ -244,6 +252,7 @@ export interface Data360Metadata {
 }
 
 export interface Data360Records {
+  dataGraphs?: Record<string, any[]>;
   crm: {
     individuals: any[];
     contactPointEmails: any[];
@@ -257,7 +266,23 @@ export interface Data360Records {
   dataCloud: Record<string, any[]>;
 }
 
+export const DATA_CLOUD_FAMILIES = ["dlo", "dmo", "unified-dmo", "link-dmo", "udmo", "data-graph", "calculated-insight"] as const;
+export type DataCloudFamily = typeof DATA_CLOUD_FAMILIES[number];
+export interface DataCloudObject {
+  name: string;
+  dataSpace: string;
+  family: DataCloudFamily;
+  storageKey: string;
+  metadata: Record<string, any>;
+}
+
 export interface ExportManifest {
+  storage?: {
+    layoutVersion: 2;
+    objectFamilies: Record<string, DataCloudFamily>;
+    objectDataSpaces?: Record<string, string>;
+    files: Array<{ path: string; bytes: number; sha256: string }>;
+  };
   version: string;
   exportTimestamp: string;
   target: {
@@ -279,6 +304,7 @@ export interface ExportManifest {
     dataStreamCount?: number;
     crmRecordCounts: Record<string, number>;
     dataCloudRecordCounts: Record<string, number>;
+    dataGraphRecordCounts?: Record<string, number>;
     unstructuredFileCounts?: {
       total: number;
       pdf: number;
@@ -326,7 +352,7 @@ export interface B2SnapshotSummary {
   orgId: string;
   targetId: string;
   manifest: ExportManifest;
-  zipFileName: string;
+  zipFileName?: string;
   totalBytes: number;
   fileCount: number;
 }
@@ -358,13 +384,6 @@ export interface MessagingSessionData360Result {
   transcripts: any[];
   customer360?: UserData360Result | null;
   extractedAt: string;
-}
-
-export interface CorrespondingDataOptions {
-  userId: string;
-  channelId: string;
-  sessionId?: string;
-  bypassCache?: boolean;
 }
 
 export interface CorrespondingDataResult {

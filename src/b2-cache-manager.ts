@@ -1,4 +1,5 @@
 import type {
+  DataCloudFamily,
   B2CacheMetadata,
   B2Config,
   B2SnapshotSummary,
@@ -6,6 +7,7 @@ import type {
   ExtractedData360Package,
   ExtractedUnstructuredFile,
 } from "./types";
+import { DATA_CLOUD_FAMILIES } from "./types";
 
 export interface B2FileEntry {
   fileId?: string;
@@ -59,6 +61,8 @@ export class B2Client implements B2ClientInterface {
   private authToken?: string;
   private apiUrl?: string;
   private downloadUrl?: string;
+  private uploadUrl?: string;
+  private uploadToken?: string;
 
   constructor(config?: B2Config) {
     this.keyId =
@@ -128,25 +132,29 @@ export class B2Client implements B2ClientInterface {
       await this.authorize();
     }
 
-    const getUrlRes = await fetch(`${this.apiUrl}/b2api/v2/b2_get_upload_url`, {
-      method: "POST",
-      headers: {
-        Authorization: this.authToken!,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ bucketId: this.bucketId }),
-    });
+    if (!this.uploadUrl || !this.uploadToken) {
+      const getUrlRes = await fetch(`${this.apiUrl}/b2api/v2/b2_get_upload_url`, {
+        method: "POST",
+        headers: {
+          Authorization: this.authToken!,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ bucketId: this.bucketId }),
+      });
 
-    if (!getUrlRes.ok) {
-      throw new Error(`Failed to acquire upload URL: ${getUrlRes.statusText}`);
+      if (!getUrlRes.ok) {
+        throw new Error(`Failed to acquire upload URL: ${getUrlRes.statusText}`);
+      }
+
+      const uploadUrlData = (await getUrlRes.json()) as any;
+      this.uploadUrl = uploadUrlData.uploadUrl;
+      this.uploadToken = uploadUrlData.authorizationToken;
     }
 
-    const uploadUrlData = (await getUrlRes.json()) as any;
-
-    const uploadRes = await fetch(uploadUrlData.uploadUrl, {
+    const uploadRes = await fetch(this.uploadUrl!, {
       method: "POST",
       headers: {
-        Authorization: uploadUrlData.authorizationToken,
+        Authorization: this.uploadToken!,
         "X-Bz-File-Name": encodeURIComponent(fileName),
         "Content-Type": contentType,
         "Content-Length": String(bytes.length),
@@ -180,7 +188,7 @@ export class B2Client implements B2ClientInterface {
       await this.authorize();
     }
 
-    const url = `${this.downloadUrl}/file/${this.bucketName}/${encodeURI(fileName)}`;
+    const url = `${this.downloadUrl}/file/${this.bucketName}/${fileName.split("/").map(encodeURIComponent).join("/")}`;
     const res = await fetch(url, {
       headers: {
         Authorization: this.authToken!,
@@ -413,9 +421,14 @@ export class B2CacheManager {
     let result: any;
     try {
       result = await downloadFn.call(this.b2Client, fileName);
-    } catch {
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
       result = null;
     }
+
+    // The native client already translates a real 404 to null. Do not retry
+    // that response with the compatibility adapter's object arguments.
+    if (result === null && this.b2Client instanceof B2Client) return null;
 
     if (!result || (typeof result.status === "number" && result.status === 404)) {
       try {
@@ -438,7 +451,7 @@ export class B2CacheManager {
     if (typeof (result as any).arrayBuffer === "function") {
       if (result.status === 404) return null;
       if (!result.ok && result.status !== 200) {
-        return null;
+        throw new Error(`B2 download returned HTTP ${result.status}`);
       }
       const buf = await result.arrayBuffer();
       return new Uint8Array(buf);
@@ -471,149 +484,97 @@ export class B2CacheManager {
     throw new Error("b2Client does not implement listFileNames method.");
   }
 
-  /**
-   * Saves an extracted Data 360 package to Backblaze B2 cache.
-   * Uploads manifest, zip archive, metadata JSONs, CRM records, Data Cloud DMOs,
-   * unstructured files, and updates latest.json pointer.
-   */
+  /** Publish a tenant-scoped snapshot only after every family object is stored. */
   async savePackage(
     pkg: ExtractedData360Package,
     options?: { ttlSeconds?: number; snapshotId?: string; orgId?: string; targetId?: string }
   ): Promise<B2CacheMetadata> {
     const orgId = options?.orgId || extractOrgId(pkg);
     const targetIdentifier = options?.targetId || extractTargetIdentifier(pkg);
-    const snapshotId =
-      options?.snapshotId || new Date().toISOString().replace(/[:.]/g, "-");
-
+    const snapshotId = options?.snapshotId || `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomUUID()}`;
+    for (const value of [orgId, targetIdentifier, snapshotId]) {
+      if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("Invalid B2 snapshot scope");
+    }
     const basePath = `${this.rootPrefix()}/${orgId}/${targetIdentifier}/snapshots/${snapshotId}`;
     let totalBytes = 0;
     let fileCount = 0;
-
-    const upload = async (
-      relativePath: string,
-      data: Uint8Array | string,
-      contentType = "application/octet-stream"
-    ) => {
-      const fullPath = `${basePath}/${relativePath}`;
-      const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-      await this.doUpload(fullPath, bytes, contentType);
+    const files: NonNullable<ExportManifest["storage"]>["files"] = [];
+    const upload = async (path: string, value: Uint8Array | string, contentType: string) => {
+      const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+      const sha256 = Array.from(digest, b => b.toString(16).padStart(2, "0")).join("");
+      await this.doUpload(`${basePath}/${path}`, bytes, contentType);
+      files.push({ path, bytes: bytes.length, sha256 });
       totalBytes += bytes.length;
       fileCount++;
     };
-
-    const uploadJson = async (relativePath: string, obj: unknown) => {
-      if (obj === undefined) return;
-      const jsonStr = JSON.stringify(obj, null, 2);
-      await upload(relativePath, jsonStr, "application/json");
+    const json = (path: string, value: unknown) => upload(path, JSON.stringify(value), "application/json");
+    const descriptors = pkg.metadata.dataCloudObjects ?? [];
+    const objectFamilies: Record<string, DataCloudFamily> = Object.fromEntries(descriptors.map(o => [o.storageKey, o.family]));
+    const metadataFallback: Partial<Record<DataCloudFamily, unknown>> = {
+      dlo: pkg.metadata.dataLakeObjects, dmo: pkg.metadata.dataModelObjects ?? pkg.metadata.dmoDescribes,
+      "data-graph": pkg.metadata.dataGraphs, "calculated-insight": pkg.metadata.calculatedInsights,
     };
-
-    // 1. Upload data360-export.zip if provided
-    if (pkg.zipBytes) {
-      await upload("data360-export.zip", pkg.zipBytes, "application/zip");
+    // Packages from older callers still contain valid rows without the new catalog.
+    for (const name of Object.keys(pkg.records.dataCloud)) objectFamilies[name] ??= "dmo";
+    for (const name of Object.keys(pkg.records.dataGraphs ?? {})) objectFamilies[name] = "data-graph";
+    for (const family of DATA_CLOUD_FAMILIES) {
+      const objects = descriptors.filter(o => o.family === family);
+      const source = family === "data-graph" ? pkg.records.dataGraphs ?? {} : pkg.records.dataCloud;
+      const rows = Object.fromEntries(Object.entries(source).filter(([name]) => objectFamilies[name] === family));
+      const metadata = objects.length ? objects.map(o => ({ ...o.metadata, dataSpace: o.dataSpace, storageKey: o.storageKey }))
+        : metadataFallback[family] ?? [];
+      await json(`metadata/${family}.json`, metadata);
+      await json(`data/${family}.json`, rows);
     }
-
-    // 2. Upload ONE data-bundle.json with every queryable record, metadata entry,
-    // and unstructured file (base64). One exploded file per entity costs 2 B2
-    // subrequests each and blows the per-invocation subrequest budget; the bundle
-    // keeps a full snapshot save to 4 uploads (zip, bundle, manifest, latest).
-    // Readers still fall back to the legacy exploded layout when no bundle exists.
-    const bundleFiles = (pkg.unstructuredFiles || []).map((file) => {
-      const fileBytes = file.data instanceof Uint8Array ? file.data : new Uint8Array(file.data as any);
-      return {
-        id: file.id,
-        sourceObject: file.sourceObject,
-        title: file.title,
-        filename: file.filename,
-        category: file.category,
-        fileType: file.fileType,
-        contentType: file.contentType,
-        contentSize: file.contentSize ?? fileBytes.length,
-        path: `files/${file.filename}`,
-        dataBase64: bytesToBase64(fileBytes),
-      };
-    });
-    await uploadJson("data-bundle.json", {
-      version: DATA_BUNDLE_VERSION,
-      metadata: pkg.metadata,
-      agent: pkg.agent,
-      records: pkg.records,
-      files: bundleFiles,
-    });
-
-    // 7. Prepare and upload manifest.json
-    const bucketName =
-      this.config?.bucketName ||
-      this.config?.bucketId ||
-      this.b2Client.bucketName ||
-      this.b2Client.bucketId ||
-      "tubot-encrypted";
-
-    const bucketId =
-      this.config?.bucketId ||
-      this.b2Client.bucketId ||
-      "tubot-encrypted";
-
-    const b2Metadata: B2CacheMetadata = {
+    const { dataCloudObjects, dataLakeObjects, dataModelObjects, dataGraphs,
+      calculatedInsights, dmoDescribes, ...context } = pkg.metadata;
+    await json("metadata/context.json", context);
+    await json("data/crm.json", pkg.records.crm);
+    await json("agent/context.json", pkg.agent);
+    const fileIndex = [];
+    for (const file of pkg.unstructuredFiles ?? []) {
+      const path = `files/${encodeURIComponent(file.category)}/${encodeURIComponent(file.id)}/${encodeURIComponent(file.filename)}`;
+      const { data, ...metadata } = file;
+      await upload(path, data instanceof Uint8Array ? data : new Uint8Array(data), file.contentType || "application/octet-stream");
+      fileIndex.push({ ...metadata, path });
+    }
+    await json("metadata/files.json", fileIndex);
+    pkg.manifest.storage = { layoutVersion: 2, objectFamilies,
+      objectDataSpaces: Object.fromEntries(descriptors.map(o => [o.storageKey, o.dataSpace])), files };
+    const metadata: B2CacheMetadata = {
       stored: true,
-      bucketName,
-      bucketId,
-      snapshotId,
-      basePath,
-      cachedAt: new Date().toISOString(),
-      expiresAt: options?.ttlSeconds
-        ? new Date(Date.now() + options.ttlSeconds * 1000).toISOString()
-        : undefined,
-      bandwidthAlliance: true,
-      totalBytes: totalBytes,
-      fileCount: fileCount + 1, // account for manifest.json
-      zipUrl: pkg.zipBytes ? `${basePath}/data360-export.zip` : undefined,
+      bucketName: this.b2Client.bucketName || this.config?.bucketName || "",
+      bucketId: this.b2Client.bucketId || this.config?.bucketId || "",
+      snapshotId, basePath, cachedAt: new Date().toISOString(),
+      ...(options?.ttlSeconds ? { expiresAt: new Date(Date.now() + options.ttlSeconds * 1000).toISOString() } : {}),
+      bandwidthAlliance: true, totalBytes, fileCount: fileCount + 1,
     };
-
-    if (pkg.manifest) {
-      pkg.manifest.b2Cache = b2Metadata;
+    pkg.manifest.b2Cache = metadata;
+    pkg.b2Cache = metadata;
+    // Resolve the self-referential manifest byte count before writing it.
+    let manifestText = "";
+    for (let i = 0; i < 10; i++) {
+      manifestText = JSON.stringify(pkg.manifest);
+      const measured = totalBytes + new TextEncoder().encode(manifestText).length;
+      if (metadata.totalBytes === measured) break;
+      metadata.totalBytes = measured;
     }
-    pkg.b2Cache = b2Metadata;
-
-    const manifestJson = JSON.stringify(pkg.manifest || {}, null, 2);
-    const manifestBytes = new TextEncoder().encode(manifestJson);
-    b2Metadata.totalBytes += manifestBytes.length;
-
-    await this.doUpload(`${basePath}/manifest.json`, manifestBytes, "application/json");
-
-    // 8. Upload latest.json pointing to this snapshotId with summary metadata
-    const summary: B2SnapshotSummary & Record<string, any> = {
-      snapshotId,
-      timestamp: pkg.manifest?.exportTimestamp || new Date().toISOString(),
-      createdTimestamp: pkg.manifest?.exportTimestamp || new Date().toISOString(),
-      orgId,
-      targetId: targetIdentifier,
-      targetIdentifier,
-      manifest: pkg.manifest,
-      zipFileName: "data360-export.zip",
-      totalBytes: b2Metadata.totalBytes,
-      fileCount: b2Metadata.fileCount,
-      recordCounts: {
-        dmoRecords: Object.values(pkg.records?.dataCloud || {}).reduce((sum, r) => sum + r.length, 0),
-        crmRecords: Object.values(pkg.records?.crm || {}).reduce((sum, r) => sum + (Array.isArray(r) ? r.length : 0), 0),
-      },
-      unstructuredFileCount: pkg.unstructuredFiles?.length || 0,
-      zipSizeBytes: pkg.zipBytes?.length || 0,
+    await this.doUpload(`${basePath}/manifest.json`, manifestText, "application/json");
+    const summary: B2SnapshotSummary = {
+      snapshotId, timestamp: pkg.manifest.exportTimestamp, orgId,
+      targetId: targetIdentifier, manifest: pkg.manifest,
+      totalBytes: metadata.totalBytes, fileCount: metadata.fileCount,
     };
-
-    const latestPath = `${this.rootPrefix()}/${orgId}/${targetIdentifier}/latest.json`;
-    await this.doUpload(
-      latestPath,
-      JSON.stringify(summary, null, 2),
-      "application/json"
-    );
-
-    return b2Metadata;
+    await this.doUpload(`${this.rootPrefix()}/${orgId}/${targetIdentifier}/latest.json`, JSON.stringify(summary), "application/json");
+    return metadata;
   }
 
   /**
    * Retrieves the latest snapshot summary for an orgId and targetId.
    */
   async getLatestSnapshot(orgId: string, targetId: string): Promise<B2SnapshotSummary | null> {
+    if (!/^[A-Za-z0-9_-]+$/.test(orgId) || !/^[A-Za-z0-9_-]+$/.test(targetId)) throw new Error("Invalid B2 snapshot scope");
     const cleanTargetId = targetId.trim().replace(/[/\\]/g, "_");
     const key = `${this.rootPrefix()}/${orgId}/${cleanTargetId}/latest.json`;
     const data = await this.doDownload(key);
@@ -654,8 +615,11 @@ export class B2CacheManager {
   async queryCachedEntity(
     orgId: string,
     targetId: string,
-    query: { dmo?: string; crmEntity?: string; file?: string; snapshotId?: string }
+    query: { dmo?: string; objectType?: DataCloudFamily; objectName?: string; dataSpace?: string; crmEntity?: string; file?: string; snapshotId?: string }
   ): Promise<any> {
+    if (!/^[A-Za-z0-9_-]+$/.test(orgId) || !/^[A-Za-z0-9_-]+$/.test(targetId) ||
+      (query.snapshotId && !/^[A-Za-z0-9_-]+$/.test(query.snapshotId))) throw new Error("Invalid B2 snapshot scope");
+    if (query.file?.split(/[\\/]/).some(part => part === ".." || part === ".")) throw new Error("Invalid cached file path");
     const cleanTargetId = targetId.trim().replace(/[/\\]/g, "_");
     let snapshotId = query.snapshotId;
 
@@ -667,12 +631,65 @@ export class B2CacheManager {
       snapshotId = latest.snapshotId;
     }
 
+    if (!snapshotId || !/^[A-Za-z0-9_-]+$/.test(snapshotId)) throw new Error("Invalid B2 snapshot scope");
+
     const snapshotPrefix = `${this.rootPrefix()}/${orgId}/${cleanTargetId}/snapshots/${snapshotId}`;
+    const storedManifestBytes = await this.doDownload(`${snapshotPrefix}/manifest.json`);
+    const manifest = storedManifestBytes ? JSON.parse(new TextDecoder().decode(storedManifestBytes)) as ExportManifest : null;
+    if (manifest?.storage?.layoutVersion === 2) {
+      const readJson = async (path: string) => {
+        const bytes = await this.doDownload(`${snapshotPrefix}/${path}`);
+        if (!bytes) throw new Error(`B2 snapshot is incomplete: ${path}`);
+        return JSON.parse(new TextDecoder().decode(bytes));
+      };
+      if (query.objectType && !DATA_CLOUD_FAMILIES.includes(query.objectType)) throw new Error("Unknown Data 360 object type");
+      const objectName = query.objectName ?? query.dmo;
+      if (objectName) {
+        const name = objectName.replace(/\.json$/, "");
+        const matches = Object.keys(manifest.storage.objectFamilies).filter(key =>
+          (key === name || key.endsWith(`/${name}`)) &&
+          (!query.dataSpace || key === `${query.dataSpace}/${name}` || manifest.storage!.objectDataSpaces?.[key] === query.dataSpace) &&
+          (!query.objectType || manifest.storage!.objectFamilies[key] === query.objectType));
+        if (!matches.length) return null;
+        if (matches.length > 1) throw new Error("Object name is ambiguous; specify its data space-qualified name");
+        const key = matches[0];
+        const family = manifest.storage.objectFamilies[key];
+        return (await readJson(`data/${family}.json`))[key] ?? null;
+      }
+      if (query.objectType) return readJson(`data/${query.objectType}.json`);
+      if (query.crmEntity) {
+        const entity = query.crmEntity.replace(/\.json$/, "");
+        const key = Object.entries(CRM_ENTITY_MAP).find(([, name]) => name === entity)?.[0] ?? entity;
+        return (await readJson("data/crm.json"))[key] ?? null;
+      }
+      if (query.file) {
+        const index = await readJson("metadata/files.json");
+        const matches = index.filter((f: any) => f.path === query.file || f.filename === query.file);
+        if (matches.length > 1) throw new Error("File name is ambiguous; specify its full snapshot path");
+        if (!matches.length) return null;
+        const file = matches[0];
+        const bytes = await this.doDownload(`${snapshotPrefix}/${file.path}`);
+        if (!bytes) throw new Error("B2 snapshot file is missing");
+        const text = new TextDecoder().decode(bytes);
+        if (/\.json$/i.test(file.filename) || /application\/json/i.test(file.contentType ?? "")) {
+          try { return JSON.parse(text); } catch { return text; }
+        }
+        if (/\.(txt|csv|md|xml|html|log)$/i.test(file.filename) || /^text\//i.test(file.contentType ?? "")) return text;
+        return bytes;
+      }
+      return manifest;
+    }
     const bundle = await this.readDataBundle(snapshotPrefix);
+
+    if (query.objectName) {
+      if (query.objectType === "data-graph") return bundle?.records?.dataGraphs?.[query.objectName] ?? null;
+      query = { ...query, dmo: query.objectName };
+    }
 
     // 1. Data Cloud DMO query
     if (query.dmo) {
       const dmoName = query.dmo.endsWith(".json") ? query.dmo.slice(0, -5) : query.dmo;
+      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(dmoName)) throw new Error("Invalid cached object name");
       const bundled = bundle?.records?.dataCloud?.[dmoName];
       if (bundled !== undefined) return bundled;
       const dmoFile = `${dmoName}.json`;
@@ -685,6 +702,7 @@ export class B2CacheManager {
 
     // 2. CRM Entity query
     if (query.crmEntity) {
+      if (!/^[A-Za-z][A-Za-z0-9_]*(\.json)?$/.test(query.crmEntity)) throw new Error("Invalid cached CRM entity");
       const entityName = query.crmEntity.endsWith(".json")
         ? query.crmEntity.slice(0, -5)
         : query.crmEntity;
@@ -780,6 +798,7 @@ export class B2CacheManager {
     targetId: string,
     snapshotId?: string
   ): Promise<Uint8Array | null> {
+    if (!/^[A-Za-z0-9_-]+$/.test(orgId) || !/^[A-Za-z0-9_-]+$/.test(targetId)) throw new Error("Invalid B2 snapshot scope");
     const cleanTargetId = targetId.trim().replace(/[/\\]/g, "_");
     let resolvedSnapshotId = snapshotId;
 
@@ -791,6 +810,7 @@ export class B2CacheManager {
       resolvedSnapshotId = latest.snapshotId;
     }
 
+    if (!resolvedSnapshotId || !/^[A-Za-z0-9_-]+$/.test(resolvedSnapshotId)) throw new Error("Invalid B2 snapshot scope");
     const key = `${this.rootPrefix()}/${orgId}/${cleanTargetId}/snapshots/${resolvedSnapshotId}/data360-export.zip`;
     const data = await this.doDownload(key);
     if (!data) return null;
@@ -805,6 +825,7 @@ export class B2CacheManager {
    * Lists all snapshot summaries for an orgId and targetId by inspecting Backblaze B2 keys.
    */
   async listSnapshots(orgId: string, targetId: string): Promise<B2SnapshotSummary[]> {
+    if (!/^[A-Za-z0-9_-]+$/.test(orgId) || !/^[A-Za-z0-9_-]+$/.test(targetId)) throw new Error("Invalid B2 snapshot scope");
     const cleanTargetId = targetId.trim().replace(/[/\\]/g, "_");
     const prefix = `${this.rootPrefix()}/${orgId}/${cleanTargetId}/snapshots/`;
     const result = await this.doListFiles(prefix);
@@ -843,20 +864,15 @@ export class B2CacheManager {
     const summaries: B2SnapshotSummary[] = [];
 
     for (const [snapshotId, entry] of snapshotMap.entries()) {
+      if (!entry.files.some(file => file.fileName === `${prefix}${snapshotId}/manifest.json`)) continue;
       let manifest: ExportManifest | null = null;
-      try {
-        const manifestKey = `${prefix}${snapshotId}/manifest.json`;
-        const manifestBytes = await this.doDownload(manifestKey);
-        if (manifestBytes) {
-          const text =
-            typeof manifestBytes === "string"
-              ? manifestBytes
-              : new TextDecoder().decode(manifestBytes);
-          manifest = JSON.parse(text);
-        }
-      } catch {
-        // Continue with empty manifest if missing
+      const manifestKey = `${prefix}${snapshotId}/manifest.json`;
+      const manifestBytes = await this.doDownload(manifestKey);
+      if (manifestBytes) {
+        const text = new TextDecoder().decode(manifestBytes);
+        manifest = JSON.parse(text);
       }
+      if (!manifest) continue;
 
       const zipFile = entry.files.find((f) => f.fileName.endsWith("data360-export.zip"));
       const zipSizeBytes = zipFile?.contentLength ?? (manifest?.summary ? (manifest as any).zipSizeBytes : undefined);
@@ -866,8 +882,8 @@ export class B2CacheManager {
         timestamp: manifest?.exportTimestamp || snapshotId,
         orgId,
         targetId: cleanTargetId,
-        manifest: manifest || ({} as ExportManifest),
-        zipFileName: "data360-export.zip",
+        manifest,
+        ...(zipFile ? { zipFileName: "data360-export.zip" } : {}),
         totalBytes: entry.totalBytes || manifest?.b2Cache?.totalBytes || 0,
         fileCount: entry.files.length || manifest?.b2Cache?.fileCount || 0,
         ...(zipSizeBytes !== undefined ? { zipSizeBytes } : {}),

@@ -90,6 +90,7 @@ describe("tubot-sf-data360 Context Provider & Smart Caching", () => {
     mockD1 = createMockD1();
     mockEnv = {
       DB: mockD1.db,
+      SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
       TUBOT_SF_AUTH: {
         async getTokenForChannel(channelId: string) {
           return {

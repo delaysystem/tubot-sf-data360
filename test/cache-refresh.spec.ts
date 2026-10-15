@@ -1,12 +1,14 @@
+import { connectApiCoverageResponse } from "./helpers/connect-api";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import worker from "../src/index";
 import { B2CacheManager } from "../src/b2-cache-manager";
 import type { Data360Env } from "../src/types";
 
-const SECRET = "test-internal-secret";
+const SECRET = "test-internal-secret-0123456789abcdef";
 
 function baseEnv(overrides?: Partial<Data360Env>): Data360Env {
   return {
+    SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
     DATA360_INTERNAL_KEY: SECRET,
     BACKBLAZE_KEY_ID: "test-key-id",
     BACKBLAZE_APPLICATION_KEY: "test-app-key",
@@ -166,6 +168,8 @@ describe("POST /cache/refresh recency short-circuit", () => {
 
     globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
       const urlStr = String(url);
+      const catalogResponse = connectApiCoverageResponse(urlStr);
+      if (catalogResponse) return catalogResponse;
       if (urlStr.includes("b2_authorize_account")) {
         return Response.json({
           authorizationToken: "auth-123",
@@ -209,6 +213,8 @@ describe("POST /cache/refresh recency short-circuit", () => {
 
     globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
       const urlStr = String(url);
+      const catalogResponse = connectApiCoverageResponse(urlStr);
+      if (catalogResponse) return catalogResponse;
       if (urlStr.includes("b2_authorize_account")) {
         return Response.json({
           authorizationToken: "auth-123",
@@ -245,12 +251,14 @@ describe("POST /cache/refresh recency short-circuit", () => {
     expect(getTokenForChannel).toHaveBeenCalled();
   });
 
-  it("skips unstructured file bytes and saves exactly 4 B2 files (subrequest budget)", async () => {
+  it("skips unstructured bytes and stores the seven family files without an archive", async () => {
     vi.spyOn(B2CacheManager.prototype, "getLatestSnapshot").mockResolvedValue(null);
 
     const fetchedUrls: string[] = [];
     globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
       const urlStr = String(url);
+      const catalogResponse = connectApiCoverageResponse(urlStr);
+      if (catalogResponse) return catalogResponse;
       fetchedUrls.push(urlStr);
       if (urlStr.includes("b2_authorize_account")) {
         return Response.json({
@@ -293,7 +301,7 @@ describe("POST /cache/refresh recency short-circuit", () => {
     for (const u of fetchedUrls) {
       expect(u).not.toMatch(/ContentVersion|ContentDocument|StaticResource|\/sfc\//);
     }
-    // Exactly zip + bundle + manifest + latest cross the B2 upload host.
-    expect(fetchedUrls.filter((u) => u.includes("upload.backblazeb2.com"))).toHaveLength(4);
+    // Seven metadata/data pairs, context, CRM, agent, file index, manifest, latest.
+    expect(fetchedUrls.filter((u) => u.includes("upload.backblazeb2.com"))).toHaveLength(20);
   });
 });

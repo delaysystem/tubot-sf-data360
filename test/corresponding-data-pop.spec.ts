@@ -172,6 +172,7 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
     env = {
       DB: mockD1.db,
       SF_CREDENTIAL_ENCRYPTION_KEY: "test-key",
+      SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
       TUBOT_SF_AUTH: {
         async getTokenForChannel(_chId: string) {
           return {

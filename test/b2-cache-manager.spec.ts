@@ -207,52 +207,16 @@ describe("B2CacheManager", () => {
       expect(b2Meta.expiresAt).toBeDefined();
       expect(b2Meta.totalBytes).toBeGreaterThan(0);
       expect(b2Meta.fileCount).toBeGreaterThan(0);
-      expect(b2Meta.zipUrl).toBe(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data360-export.zip"
-      );
-
-      // Verify files uploaded into mock storage
-      const uploadedKeys = Array.from(mockClient.files.keys());
-
-      // 1. latest.json pointer
-      expect(uploadedKeys).toContain("data360/acme-corp/0Mj000000000001/latest.json");
-
-      // 2. manifest.json
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/manifest.json"
-      );
-
-      // 3. data360-export.zip
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data360-export.zip"
-      );
-
-      // 4. Single data-bundle.json replaces the exploded per-entity layout
-      // (one exploded file per entity costs 2 B2 subrequests each and exceeds
-      // the per-invocation subrequest budget on small plans).
-      expect(uploadedKeys).toContain(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data-bundle.json"
-      );
-      const bundleRaw = mockClient.files.get(
-        "data360/acme-corp/0Mj000000000001/snapshots/snap-2026-09-25/data-bundle.json"
-      );
-      const bundle = JSON.parse(new TextDecoder().decode(bundleRaw!.data));
-      expect(bundle.version).toBe(1);
-      expect(bundle.records.crm.individuals[0].FirstName).toBe("John");
-      expect(bundle.records.dataCloud["UnifiedIndividual__dlm"][0].firstName__c).toBe("John");
-      expect(bundle.metadata.marketSegments).toBeDefined();
-      expect(bundle.files.map((f: any) => f.filename).sort()).toEqual([
-        "firmware.bin",
-        "policy.txt",
-      ]);
-
-      // 5. No exploded per-entity uploads (subrequest budget)
-      for (const key of uploadedKeys) {
-        expect(key).not.toMatch(/\/metadata\/(segments|data-spaces|dmos|files-manifest)/);
-        expect(key).not.toMatch(/\/data\/(crm|data-cloud)\//);
-        expect(key).not.toMatch(/\/files\//);
-      }
-      expect(uploadedKeys).toHaveLength(4); // zip, bundle, manifest, latest
+      expect(b2Meta.zipUrl).toBeUndefined();
+      const keys = Array.from(mockClient.files.keys());
+      expect(keys.some(key => key.endsWith('.zip') || key.endsWith('data-bundle.json'))).toBe(false);
+      expect(keys).toContain(b2Meta.basePath + '/data/dmo.json');
+      expect(keys).toContain(b2Meta.basePath + '/metadata/files.json');
+      expect(keys.filter(key => key.includes('/files/'))).toHaveLength(2);
+      expect(keys).toHaveLength(22);
+      expect(samplePkg.manifest.storage?.layoutVersion).toBe(2);
+      const rows = JSON.parse(new TextDecoder().decode(mockClient.files.get(b2Meta.basePath + '/data/dmo.json')!.data));
+      expect(rows.UnifiedIndividual__dlm[0].firstName__c).toBe('John');
     });
 
     it("handles package without zipBytes or unstructured files", async () => {
@@ -410,7 +374,7 @@ describe("B2CacheManager", () => {
       expect(summary?.orgId).toBe("acme-corp");
       expect(summary?.targetId).toBe("0Mj000000000001");
       expect(summary?.manifest.target.agentName).toBe("SupportAgent");
-      expect(summary?.zipFileName).toBe("data360-export.zip");
+      expect(summary?.zipFileName).toBeUndefined();
       expect(summary?.totalBytes).toBeGreaterThan(0);
       expect(summary?.fileCount).toBeGreaterThan(0);
     });
@@ -572,6 +536,8 @@ describe("B2CacheManager", () => {
       await cacheManager.savePackage(samplePkg, {
         snapshotId: "snap-zip-test",
       });
+      // Explicit pre-existing legacy ZIP, independent of the new writer.
+      mockClient.files.set('data360/acme-corp/0Mj000000000001/snapshots/snap-zip-test/data360-export.zip', { data: samplePkg.zipBytes! });
     });
 
     it("downloads cached zip bytes from latest snapshot when snapshotId is omitted", async () => {
@@ -620,7 +586,7 @@ describe("B2CacheManager", () => {
 
       expect(snapshots[0].orgId).toBe("acme-corp");
       expect(snapshots[0].targetId).toBe("0Mj000000000001");
-      expect(snapshots[0].zipFileName).toBe("data360-export.zip");
+      expect(snapshots[0].zipFileName).toBeUndefined();
       expect(snapshots[0].totalBytes).toBeGreaterThan(0);
       expect(snapshots[0].fileCount).toBeGreaterThan(0);
       expect(snapshots[0].manifest.target.agentName).toBe("SupportAgent");
@@ -681,8 +647,7 @@ describe("B2CacheManager", () => {
       expect(latest?.snapshotId).toBe("snap-obj-1");
 
       const zip = await mgr.downloadCachedZip("acme-corp", "0Mj000000000001");
-      expect(zip).not.toBeNull();
-      expect(zip![0]).toBe(0x50);
+      expect(zip).toBeNull();
 
       const dmo = await mgr.queryCachedEntity("acme-corp", "0Mj000000000001", {
         dmo: "UnifiedIndividual__dlm",
