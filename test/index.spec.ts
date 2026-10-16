@@ -7,7 +7,33 @@ describe("tubot-sf-data360 worker endpoints", () => {
 
   const cacheHeaders = { Authorization: "Bearer package-coverage-token", "x-salesforce-instance-url": "https://test.my.salesforce.com" };
 
+  const nonces = new Map<string, number>();
+  const mockDb = {
+    prepare(sql: string) {
+      let bound: any[] = [];
+      const stmt = {
+        bind(...args: any[]) { bound = args; return stmt; },
+        async run() {
+          const lower = sql.toLowerCase();
+          if (lower.includes("salesforce_self_oauth_internal_nonce")) {
+            if (lower.startsWith("delete ")) {
+              for (const [k, v] of nonces.entries()) { if (v <= bound[0]) nonces.delete(k); }
+              return { success: true, meta: { changes: 0 } };
+            }
+            if (nonces.has(bound[0])) return { success: true, meta: { changes: 0 } };
+            nonces.set(bound[0], bound[1]);
+            return { success: true, meta: { changes: 1 } };
+          }
+          return { success: true, meta: { changes: 0 } };
+        },
+      };
+      return stmt;
+    },
+  } as unknown as D1Database;
+
   const mockEnv: Data360Env = {
+    DB: mockDb,
+    DATA360_INTERNAL_KEY: "mesh-key-0123456789abcdef0123456789abcd",
     BACKBLAZE_KEY_ID: "test-key-id",
     BACKBLAZE_APPLICATION_KEY: "test-app-key",
     BACKBLAZE_BUCKET_ID: "tubot-encrypted",
@@ -421,13 +447,19 @@ describe("tubot-sf-data360 worker endpoints", () => {
         return new Response("Not found", { status: 404 });
       });
 
-      const latest = await entrypoint.getLatestCache({ agentName: "RPCAgent", accessToken: "package-coverage-token", instanceUrl: "https://test.my.salesforce.com" });
+      const { signRpcEnvelope } = await import("../../tubot-new-panel/worker/service-signer");
+      const sign = async (method: string, args: unknown) => {
+        const h = await signRpcEnvelope(mockEnv.DATA360_INTERNAL_KEY!, method, args);
+        return { timestamp: h["x-tubot-sig-timestamp"], nonce: h["x-tubot-sig-nonce"], signature: h["x-tubot-sig-signature"] };
+      };
+      const rpcOpts = { agentName: "RPCAgent", accessToken: "package-coverage-token", instanceUrl: "https://test.my.salesforce.com" };
+      const latest = await entrypoint.getLatestCache(rpcOpts, await sign("getLatestCache", [rpcOpts]));
       expect(latest?.snapshotId).toBe("rpc-snap");
 
-      const zip = await entrypoint.downloadCachedZip({ agentName: "RPCAgent", accessToken: "package-coverage-token", instanceUrl: "https://test.my.salesforce.com" });
+      const zip = await entrypoint.downloadCachedZip(rpcOpts, await sign("downloadCachedZip", [rpcOpts]));
       expect(zip).toEqual(new Uint8Array([1, 2, 3]));
 
-      const snapshots = await entrypoint.listSnapshots({ agentName: "RPCAgent", accessToken: "package-coverage-token", instanceUrl: "https://test.my.salesforce.com" });
+      const snapshots = await entrypoint.listSnapshots(rpcOpts, await sign("listSnapshots", [rpcOpts]));
       expect(snapshots).toEqual([]);
     });
   });

@@ -28,6 +28,24 @@ export function readSigHeaders(headers: Headers): ServiceSigHeaders | null {
   return { timestamp, nonce, signature };
 }
 
+/** RPC envelopes: bare names, or raw panel signer output (header names). */
+export type RpcEnvelopeInput = ServiceSigHeaders | {
+  "x-tubot-sig-timestamp"?: unknown;
+  "x-tubot-sig-nonce"?: unknown;
+  "x-tubot-sig-signature"?: unknown;
+};
+
+/** Normalizes either envelope shape to bare names; garbage stays garbage (rejected downstream). */
+export function normalizeRpcEnvelope(envelope: RpcEnvelopeInput | undefined | null): ServiceSigHeaders | undefined {
+  if (!envelope || typeof envelope !== "object") return undefined;
+  const e = envelope as Record<string, unknown>;
+  return {
+    timestamp: (e.timestamp ?? e["x-tubot-sig-timestamp"] ?? "") as string,
+    nonce: (e.nonce ?? e["x-tubot-sig-nonce"] ?? "") as string,
+    signature: (e.signature ?? e["x-tubot-sig-signature"] ?? "") as string,
+  };
+}
+
 function base64url(bytes: Uint8Array): string {
   let s = "";
   for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
@@ -93,11 +111,33 @@ export interface NonceDb {
     bind(...args: unknown[]): {
       run(): Promise<{ meta?: { changes?: number } }>;
     };
+    run(): Promise<{ meta?: { changes?: number } }>;
   };
+}
+
+/** RPC caller auth: same mesh key as the fetch HMAC, canonicalized over the
+ * method name and JSON args. Envelopes are produced by signRpcEnvelope
+ * (panel worker/service-signer.ts). No keys, DB, or envelope fails closed. */
+export async function verifyRpcEnvelope(
+  keys: string[],
+  db: NonceDb | undefined,
+  method: string,
+  args: unknown,
+  envelope: RpcEnvelopeInput | undefined,
+  nowSec: number = Math.floor(Date.now() / 1000),
+): Promise<boolean> {
+  const bare = normalizeRpcEnvelope(envelope);
+  if (!bare || !db || !/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(method)) return false;
+  const validKeys = keys.filter((k): k is string => typeof k === "string" && k.length >= 32);
+  if (validKeys.length === 0) return false;
+  const bodyText = JSON.stringify(args ?? null);
+  return (await verifyServiceSignature(validKeys, "RPC", `/rpc/${method}`, bodyText, bare, nowSec)) &&
+    (await claimServiceNonce(db, bare.nonce, nowSec));
 }
 
 /** Single-use nonce claim. Returns false on replay (or D1 failure fail-closed by caller choice). */
 export async function claimServiceNonce(db: NonceDb, nonce: string, nowSec: number): Promise<boolean> {
+  await db.prepare("CREATE TABLE IF NOT EXISTS salesforce_self_oauth_internal_nonce (nonce_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)").run();
   const nonceHash = await sha256Hex(`sig-nonce:${nonce}`);
   await db.prepare("DELETE FROM salesforce_self_oauth_internal_nonce WHERE expires_at <= ?").bind(nowSec).run();
   const inserted = await db.prepare(

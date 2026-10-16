@@ -166,6 +166,8 @@ export interface ExportData360Options {
   includeTools?: boolean;
   includeAgentScript?: boolean;
   includeAgentXml?: boolean;
+  /** Resume a budget-exhausted agent retrieve from a prior manifest instead of starting over. */
+  resumeAgentRetrieve?: { asyncId: string; apiVersion: string };
   includeUnstructuredFiles?: boolean;
   maxUnstructuredFiles?: number;
   cacheToB2?: boolean;
@@ -208,6 +210,7 @@ export interface AgentArtifacts {
   agentGraph?: Record<string, unknown>;
   localActions?: Record<string, unknown>;
   rawFiles?: Record<string, string>;
+  rawPaths?: Record<string, string>;
   callableTools?: Array<{
     url?: string;
     id?: string;
@@ -334,6 +337,10 @@ export interface ExportManifest {
   };
   b2Cache?: B2CacheMetadata;
   warnings?: string[];
+  /** Agent retrieve still running when the poll budget expired: resume on the next refresh. */
+  pendingAgentRetrieve?: { asyncId: string; apiVersion: string; agent: string; attempts: number; startedAt: string };
+  /** Content-addressed agent definition blob written alongside the snapshot. */
+  agentBlob?: { sha: string; bytes: number; files: string[] };
 }
 
 export interface B2Config {

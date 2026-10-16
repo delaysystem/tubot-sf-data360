@@ -9,12 +9,12 @@ import type {
 class MockB2Client implements B2ClientInterface {
   public bucketId = "test-bucket-id";
   public bucketName = "test-bucket-name";
-  public files = new Map<string, { data: Uint8Array; contentType?: string }>();
+  public files = new Map<string, { data: Uint8Array; contentType?: string; uploadTimestamp: number }>();
   public uploadCalls: Array<{ fileName: string; size: number; contentType?: string }> = [];
 
   async uploadFile(fileName: string, data: Uint8Array | string, contentType?: string) {
     const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-    this.files.set(fileName, { data: bytes, contentType });
+    this.files.set(fileName, { data: bytes, contentType, uploadTimestamp: Date.now() });
     this.uploadCalls.push({ fileName, size: bytes.length, contentType });
     return {
       fileId: `file-${this.uploadCalls.length}`,
@@ -28,6 +28,11 @@ class MockB2Client implements B2ClientInterface {
     return file ? file.data : null;
   }
 
+  async deleteFileVersion(params: { fileName: string; fileId: string }) {
+    this.files.delete(params.fileName);
+    return { fileId: params.fileId, fileName: params.fileName };
+  }
+
   async listFileNames(
     prefixOrOptions?:
       | string
@@ -35,7 +40,7 @@ class MockB2Client implements B2ClientInterface {
   ) {
     const prefix =
       typeof prefixOrOptions === "string" ? prefixOrOptions : prefixOrOptions?.prefix || "";
-    const matching: Array<{ fileId: string; fileName: string; contentLength: number }> = [];
+    const matching: Array<{ fileId: string; fileName: string; contentLength: number; uploadTimestamp: number }> = [];
 
     for (const [name, file] of this.files.entries()) {
       if (name.startsWith(prefix)) {
@@ -43,6 +48,7 @@ class MockB2Client implements B2ClientInterface {
           fileId: `id-${name}`,
           fileName: name,
           contentLength: file.data.length,
+          uploadTimestamp: file.uploadTimestamp,
         });
       }
     }
@@ -675,6 +681,74 @@ describe("B2CacheManager", () => {
         dmo: "UnifiedIndividual__dlm",
       });
       expect(dmo[0].firstName__c).toBe("John");
+    });
+  });
+
+  describe("agent blobs", () => {
+    const files = {
+      "bots/CoolAgent.bot": "<Bot/>",
+      "genAiPlannerBundles/CoolAgent/CoolAgent.genAiPlannerBundle": "<Planner/>",
+      "genAiPromptTemplates/T1.genAiPromptTemplate": "<Prompt/>",
+    };
+
+    it("round-trips pointer plus integrity-verified blob", async () => {
+      const saved = await cacheManager.saveAgentBlob("00Dorg000000001", "CoolAgent", files, "snap-1");
+      expect(saved.sha).toMatch(/^[0-9a-f]{64}$/);
+      expect(saved.files).toHaveLength(3);
+      const pointer = await cacheManager.readAgentPointer("00Dorg000000001", "CoolAgent");
+      expect(pointer?.sha).toBe(saved.sha);
+      expect(pointer?.snapshotId).toBe("snap-1");
+      const blob = await cacheManager.downloadAgentBlob(saved.sha);
+      expect(blob?.files).toEqual(files);
+    });
+
+    it("is deterministic in file order and rejects scope escapes", async () => {
+      const a = await cacheManager.saveAgentBlob("00Dorg000000001", "A1", files);
+      const reversed = Object.fromEntries(Object.entries(files).reverse());
+      const b = await cacheManager.saveAgentBlob("00Dorg000000001", "A2", reversed);
+      expect(a.sha).toBe(b.sha);
+      await expect(cacheManager.saveAgentBlob("00Dorg000000001", "../evil", files)).rejects.toThrow("Invalid B2 agent blob scope");
+      await expect(cacheManager.saveAgentBlob("bad org!", "A1", files)).rejects.toThrow("Invalid B2 agent blob scope");
+      await expect(cacheManager.downloadAgentBlob("not-a-sha")).rejects.toThrow("Invalid B2 agent blob scope");
+      expect(await cacheManager.readAgentPointer("00Dorg000000001", "Missing")).toBeNull();
+    });
+
+    it("detects tampered blob bytes", async () => {
+      const saved = await cacheManager.saveAgentBlob("00Dorg000000001", "CoolAgent", files);
+      const key = `data360/blobs/sha256/${saved.sha}`;
+      const stored = mockClient.files.get(key)!;
+      mockClient.files.set(key, { ...stored, data: new TextEncoder().encode(storeTampered(stored.data)) });
+      await expect(cacheManager.downloadAgentBlob(saved.sha)).rejects.toThrow("agent blob sha mismatch");
+      function storeTampered(data: Uint8Array): string {
+        const doc = JSON.parse(new TextDecoder().decode(data));
+        doc.files["bots/CoolAgent.bot"] = "<Evil/>";
+        return JSON.stringify(doc);
+      }
+    });
+
+    it("lists cached agent names per org", async () => {
+      await cacheManager.saveAgentBlob("00Dorg000000001", "CoolAgent", files);
+      await cacheManager.saveAgentBlob("00Dorg000000001", "BillingAgent", { "bots/BillingAgent.bot": "<b/>" });
+      await cacheManager.saveAgentBlob("00Dother000000002", "Elsewhere", { "bots/Elsewhere.bot": "<b/>" });
+      expect(await cacheManager.listAgentPointers("00Dorg000000001")).toEqual(["BillingAgent", "CoolAgent"]);
+      expect(await cacheManager.listAgentPointers("00Dother000000002")).toEqual(["Elsewhere"]);
+    });
+  });
+
+  describe("sweepOrphanSnapshots", () => {
+    const snapPrefix = (id: string) => `data360/acme-corp/0Mj000000000001/snapshots/${id}`;
+
+    it("deletes only old manifest-less prefixes, never published history", async () => {
+      await cacheManager.savePackage(samplePkg, { snapshotId: "published-1" });
+      const old = Date.now() - 7200_000;
+      mockClient.files.set(`${snapPrefix("orphan-1")}/data/dmo.json`, { data: new TextEncoder().encode("{}"), uploadTimestamp: old });
+      mockClient.files.set(`${snapPrefix("orphan-1")}/data/crm.json`, { data: new TextEncoder().encode("{}"), uploadTimestamp: old });
+      mockClient.files.set(`${snapPrefix("fresh-crash")}/data/dmo.json`, { data: new TextEncoder().encode("{}"), uploadTimestamp: Date.now() });
+      const swept = await cacheManager.sweepOrphanSnapshots("acme-corp", "0Mj000000000001", new Set(["published-1"]));
+      expect(swept.deletedSnapshots).toEqual(["orphan-1"]);
+      expect(swept.deletedFiles).toBe(2);
+      expect(mockClient.files.has(`${snapPrefix("published-1")}/manifest.json`)).toBe(true);
+      expect(mockClient.files.has(`${snapPrefix("fresh-crash")}/data/dmo.json`)).toBe(true);
     });
   });
 });

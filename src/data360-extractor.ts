@@ -19,7 +19,7 @@ import { DataCloudClient, DATA_CLOUD_RETRIEVE_SUBREQUEST_BUDGET } from "./data-c
 import { UnstructuredExtractor, UNSTRUCTURED_LISTING_QUERIES } from "./unstructured-extractor";
 import type { UnstructuredFileListings } from "./unstructured-extractor";
 import { B2CacheManager } from "./b2-cache-manager";
-import { getAgentScripts, getCallableToolUrlsForChannel } from "../../tubot-sf-auth/src/agent-script";
+import { getAgentScripts, getCallableToolUrlsForChannel, RetrievePendingError } from "../../tubot-sf-auth/src/agent-script";
 
 export class Data360Extractor {
   constructor(
@@ -61,15 +61,22 @@ export class Data360Extractor {
     };
 
     // SOAP retrieve costs several subrequests; only fetch when agent artifacts were requested.
+    // Budget exhaustion records a resumable async id on the manifest; the next
+    // refresh resumes it instead of starting over.
+    let pendingAgentRetrieve: ExportManifest["pendingAgentRetrieve"];
+    // Resumed polls must use the version the retrieve began with.
+    const retrieveApiVersion = options.resumeAgentRetrieve?.apiVersion ?? apiVersion.replace(/^v/, "");
+    const retrieveT0 = Date.now();
     if (!options.includeAgentScript && !options.includeAgentXml) {
       warnings.push("Agent script retrieve skipped: agent artifacts were not requested.");
     } else try {
       const retrieveResult = await getAgentScripts(conn, {
         agentNames: [agentName],
         channelNames: channelDeveloperName ? [channelDeveloperName] : undefined,
-        apiVersion: apiVersion.replace(/^v/, ""),
-        maxPollAttempts: 3,
-        pollIntervalMs: 800,
+        apiVersion: retrieveApiVersion,
+        maxPollAttempts: 10,
+        pollIntervalMs: 1500,
+        resumeAsyncId: options.resumeAgentRetrieve?.asyncId,
       });
 
       if (retrieveResult.ok && retrieveResult.scripts[agentName]) {
@@ -84,21 +91,39 @@ export class Data360Extractor {
           agentGraph: s.agentGraph,
           localActions: s.localActions,
           rawFiles: s.rawFiles,
+          rawPaths: s.rawPaths,
         };
+      } else {
+        warnings.push(`Agent script retrieve returned no definition for ${agentName}.`);
       }
+      console.log(JSON.stringify({ event: "data360_agent_retrieve", agent: agentName, outcome: retrieveResult.ok && retrieveResult.scripts[agentName] ? "ok" : "empty", resumed: !!options.resumeAgentRetrieve, latencyMs: Date.now() - retrieveT0 }));
     } catch (err: unknown) {
-      warnings.push(`Agent script retrieve encountered an issue: ${err instanceof Error ? err.message : String(err)}`);
+      if (err instanceof RetrievePendingError) {
+        pendingAgentRetrieve = {
+          asyncId: err.asyncId, apiVersion: retrieveApiVersion,
+          agent: agentName, attempts: err.attempts, startedAt: new Date().toISOString(),
+        };
+        warnings.push(`Agent script retrieve still running after ${err.attempts} polls; resuming on next refresh (async ${err.asyncId}).`);
+        console.log(JSON.stringify({ event: "data360_agent_retrieve", agent: agentName, outcome: "pending", attempts: err.attempts, latencyMs: Date.now() - retrieveT0 }));
+      } else {
+        warnings.push(`Agent script retrieve encountered an issue: ${err instanceof Error ? err.message : String(err)}`);
+        console.log(JSON.stringify({ event: "data360_agent_retrieve", agent: agentName, outcome: "error", error: err instanceof Error ? err.message : String(err), latencyMs: Date.now() - retrieveT0 }));
+      }
     }
 
-    // Retrieve callable tools if channel is known and tools are requested
+    // Retrieve callable tools if channel is known and tools are requested.
+    // Reuses the artifacts retrieved above instead of issuing a second retrieve.
     if (options.includeTools !== false && (options.channelId || channelRecord?.Id)) {
       try {
         const channelLookupId = channelRecord?.Id || options.channelId!;
         const toolUrls = await getCallableToolUrlsForChannel(channelLookupId, {
           conn,
           apiVersion: apiVersion.replace(/^v/, ""),
-          maxPollAttempts: 15,
-          pollIntervalMs: 1000,
+          maxPollAttempts: 10,
+          pollIntervalMs: 1500,
+          ...(agentArtifacts.script !== undefined ? {
+            prefetched: { script: agentArtifacts.script, promptTemplates: agentArtifacts.promptTemplates },
+          } : {}),
         });
 
         if (Array.isArray(toolUrls) && toolUrls.length > 0) {
@@ -419,6 +444,7 @@ export class Data360Extractor {
         cache: getCacheStats(),
       },
       warnings: warnings.length > 0 ? warnings : undefined,
+      ...(pendingAgentRetrieve ? { pendingAgentRetrieve } : {}),
     };
 
     const pkg: ExtractedData360Package = {
@@ -440,11 +466,40 @@ export class Data360Extractor {
         const cacheMgr = this.b2CacheManager || new B2CacheManager();
         const b2Meta = await cacheMgr.savePackage(pkg, {
           ttlSeconds: options.cacheTtlSeconds,
+          sweepOrphans: true,
         });
         pkg.b2Cache = b2Meta;
         manifest.b2Cache = b2Meta;
+        // Content-addressed agent blob: full snapshot-style paths, written
+        // best-effort (records stay valuable even if the blob write fails).
+        try {
+          const blobFiles: Record<string, string> = {};
+          if (agentArtifacts.rawFiles && agentArtifacts.rawPaths) {
+            for (const [key, content] of Object.entries(agentArtifacts.rawFiles)) {
+              const full = agentArtifacts.rawPaths[key];
+              if (typeof full === "string" && typeof content === "string") blobFiles[full] = content;
+            }
+          }
+          const blobOrg = conn.orgId || options.orgId;
+          if (Object.keys(blobFiles).length > 0 && blobOrg) {
+            const blob = await cacheMgr.saveAgentBlob(blobOrg, agentName, blobFiles, b2Meta.snapshotId);
+            manifest.agentBlob = blob;
+          } else if (Object.keys(blobFiles).length > 0) {
+            warnings.push("Agent blob skipped: org id unavailable for the B2 pointer.");
+          }
+        } catch (blobErr: unknown) {
+          warnings.push(`Agent blob write failed: ${blobErr instanceof Error ? blobErr.message : "upstream storage error"}`);
+        }
       } catch (err: unknown) {
-        throw new Error(`B2 snapshot storage failed: ${err instanceof Error ? err.message : "upstream storage error"}`);
+        // Storage failure must not destroy the extraction: the package is
+        // still returned (and refresh callers check `stored` explicitly).
+        const failure = {
+          stored: false, bucketName: "", bucketId: "", snapshotId: "", basePath: "",
+          cachedAt: new Date().toISOString(), bandwidthAlliance: true, totalBytes: 0, fileCount: 0,
+        };
+        pkg.b2Cache = failure;
+        manifest.b2Cache = failure;
+        warnings.push(`B2 snapshot storage failed: ${err instanceof Error ? err.message : "upstream storage error"}`);
       }
     }
 

@@ -18,6 +18,7 @@ function createMockD1(): D1Database {
   const tables = new Map<string, Map<string, any>>();
   tables.set("data360_user_cache", new Map());
   tables.set("data360_session_cache", new Map());
+  tables.set("salesforce_self_oauth_internal_nonce", new Map());
 
   return {
     async exec(_sql: string) {
@@ -25,6 +26,10 @@ function createMockD1(): D1Database {
     },
     prepare(sql: string) {
       return {
+        async run() {
+          // Unbound statements (CREATE TABLE IF NOT EXISTS only in covered paths).
+          return { success: true, meta: { changes: 0 } };
+        },
         bind(...args: any[]) {
           return {
             async first<T = any>() {
@@ -45,6 +50,18 @@ function createMockD1(): D1Database {
             },
             async run() {
               const lower = sql.toLowerCase();
+              if (lower.includes("salesforce_self_oauth_internal_nonce")) {
+                const table = tables.get("salesforce_self_oauth_internal_nonce")!;
+                if (lower.startsWith("delete ")) {
+                  for (const [k, v] of table.entries()) {
+                    if ((v as any).expires_at <= args[0]) table.delete(k);
+                  }
+                  return { success: true, meta: { changes: 0 } };
+                }
+                if (table.has(args[0])) return { success: true, meta: { changes: 0 } };
+                table.set(args[0], { hash: args[0], expires_at: args[1] });
+                return { success: true, meta: { changes: 1 } };
+              }
               if (lower.includes("insert into data360_user_cache")) {
                 const userTable = tables.get("data360_user_cache")!;
                 let userId: string;
@@ -353,6 +370,7 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
       const mockDb = createMockD1();
       mockEnv = {
         DB: mockDb,
+        DATA360_INTERNAL_KEY: "mesh-key-0123456789abcdef0123456789abcd",
         BACKBLAZE_KEY_ID: "test-key-id",
         BACKBLAZE_APPLICATION_KEY: "test-app-key",
         BACKBLAZE_BUCKET_ID: "tubot-encrypted",
@@ -491,42 +509,47 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
     });
 
     it("TubotSfData360Entrypoint RPC methods execute cache and extraction flows cleanly", async () => {
+      const { signRpcEnvelope } = await import("../../tubot-new-panel/worker/service-signer");
       const mockCtx = { cache: { purge: vi.fn().mockResolvedValue(true) } };
       const entrypoint = new TubotSfData360Entrypoint(mockCtx, mockEnv);
+      const sign = async (method: string, args: unknown) => {
+        const h = await signRpcEnvelope(mockEnv.DATA360_INTERNAL_KEY!, method, args);
+        return { timestamp: h["x-tubot-sig-timestamp"], nonce: h["x-tubot-sig-nonce"], signature: h["x-tubot-sig-signature"] };
+      };
 
       // 1. saveUserData360 RPC
-      const saveUserRes = await entrypoint.saveUserData360("RPC_USER_01", { name: "RPC User" });
+      const saveUserRes = await entrypoint.saveUserData360("RPC_USER_01", { name: "RPC User" }, undefined, await sign("saveUserData360", ["RPC_USER_01", { name: "RPC User" }, undefined]));
       expect(saveUserRes.ok).toBe(true);
       expect(saveUserRes.userId).toBe("RPC_USER_01");
       expect(saveUserRes.purgedTag).toBe("data360-user-RPC_USER_01");
 
       // 2. getUserData360 RPC (hits D1 cache)
-      const fetchedUser = await entrypoint.getUserData360("RPC_USER_01");
+      const fetchedUser = await entrypoint.getUserData360("RPC_USER_01", undefined, await sign("getUserData360", ["RPC_USER_01", undefined]));
       expect(fetchedUser).toEqual({ name: "RPC User" });
 
       // 3. saveMessagingSessionData360 RPC
       const saveSessionRes = await entrypoint.saveMessagingSessionData360("RPC_SESS_01", {
         status: "Active",
-      });
+      }, undefined, await sign("saveMessagingSessionData360", ["RPC_SESS_01", { status: "Active" }, undefined]));
       expect(saveSessionRes.ok).toBe(true);
       expect(saveSessionRes.sessionId).toBe("RPC_SESS_01");
       expect(saveSessionRes.purgedTag).toBe("data360-session-RPC_SESS_01");
 
       // 4. getMessagingSessionData360 RPC (hits D1 cache)
-      const fetchedSession = await entrypoint.getMessagingSessionData360("RPC_SESS_01");
+      const fetchedSession = await entrypoint.getMessagingSessionData360("RPC_SESS_01", undefined, await sign("getMessagingSessionData360", ["RPC_SESS_01", undefined]));
       expect(fetchedSession).toEqual({ status: "Active" });
 
       // 5. purgeCache RPC
-      const purgeResult = await entrypoint.purgeCache(["data360-user", "custom-tag"]);
+      const purgeResult = await entrypoint.purgeCache(["data360-user", "custom-tag"], await sign("purgeCache", [["data360-user", "custom-tag"]]));
       expect(purgeResult.ok).toBe(true);
       expect(purgeResult.tags).toEqual(["data360-user", "custom-tag"]);
 
       // 6. getUserETag & getSessionETag RPC
-      const userEtag = await entrypoint.getUserETag("RPC_USER_01");
+      const userEtag = await entrypoint.getUserETag("RPC_USER_01", await sign("getUserETag", ["RPC_USER_01"]));
       expect(userEtag).toBeDefined();
       expect(typeof userEtag).toBe("string");
 
-      const sessionEtag = await entrypoint.getSessionETag("RPC_SESS_01");
+      const sessionEtag = await entrypoint.getSessionETag("RPC_SESS_01", await sign("getSessionETag", ["RPC_SESS_01"]));
       expect(sessionEtag).toBeDefined();
       expect(typeof sessionEtag).toBe("string");
     });

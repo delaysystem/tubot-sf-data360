@@ -21,6 +21,7 @@ function createMockD1(): { db: D1Database; tables: Map<string, Map<string, any>>
   tables.set("data360_session_cache", new Map());
   tables.set("data360_conversation_cache", new Map());
   tables.set("data360_global_cache", new Map());
+  tables.set("salesforce_self_oauth_internal_nonce", new Map());
 
   const db = {
     async exec(_sql: string) {
@@ -57,6 +58,18 @@ function createMockD1(): { db: D1Database; tables: Map<string, Map<string, any>>
           const lower = sql.toLowerCase();
           if (lower.includes("create table")) {
             return { success: true, meta: { changes: 0 } };
+          }
+          if (lower.includes("salesforce_self_oauth_internal_nonce")) {
+            const table = tables.get("salesforce_self_oauth_internal_nonce")!;
+            if (lower.startsWith("delete ")) {
+              for (const [k, v] of table.entries()) {
+                if ((v as any).expires_at <= boundArgs[0]) table.delete(k);
+              }
+              return { success: true, meta: { changes: 0 } };
+            }
+            if (table.has(boundArgs[0])) return { success: true, meta: { changes: 0 } };
+            table.set(boundArgs[0], { hash: boundArgs[0], expires_at: boundArgs[1] });
+            return { success: true, meta: { changes: 1 } };
           }
           if (lower.includes("insert into data360_user_cache")) {
             const table = tables.get("data360_user_cache")!;
@@ -171,6 +184,7 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
 
     env = {
       DB: mockD1.db,
+      DATA360_INTERNAL_KEY: "mesh-key-0123456789abcdef0123456789abcd",
       SF_CREDENTIAL_ENCRYPTION_KEY: "test-key",
       SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
       TUBOT_SF_AUTH: {
@@ -468,15 +482,21 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
 
   describe("Phase 3: RPC Entrypoint Pop Testing", () => {
     it("TubotSfData360Entrypoint.getCorrespondingData retrieves and caches all 3 components via RPC", async () => {
+      const { signRpcEnvelope } = await import("../../tubot-new-panel/worker/service-signer");
       const entrypoint = new TubotSfData360Entrypoint({ waitUntil: () => {} }, env);
+      const sign = async (args: unknown) => {
+        const h = await signRpcEnvelope(env.DATA360_INTERNAL_KEY!, "getCorrespondingData", args);
+        return { timestamp: h["x-tubot-sig-timestamp"], nonce: h["x-tubot-sig-nonce"], signature: h["x-tubot-sig-signature"] };
+      };
 
-      const result1 = await entrypoint.getCorrespondingData({
+      const args1 = {
         userId,
         channelId,
         sessionId: session1Id,
         accessToken: "test-token",
         instanceUrl: "https://test.my.salesforce.com",
-      });
+      };
+      const result1 = await entrypoint.getCorrespondingData(args1, await sign([args1]));
 
       expect(result1.ok).toBe(true);
       expect(result1.userId).toBe(userId);
@@ -487,11 +507,12 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
       expect(result1.cacheBreakdown.conversationHistory.cached).toBe(false);
 
       // Second invocation via RPC: all 3 should be cached (HIT)
-      const result2 = await entrypoint.getCorrespondingData({
+      const args2 = {
         userId,
         channelId,
         sessionId: session1Id,
-      });
+      };
+      const result2 = await entrypoint.getCorrespondingData(args2, await sign([args2]));
 
       expect(result2.ok).toBe(true);
       expect(result2.compositeETag).toBe(result1.compositeETag);

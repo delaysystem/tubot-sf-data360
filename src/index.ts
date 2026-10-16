@@ -4,6 +4,7 @@ import type {
   ContextResult,
   Data360Env,
   ExportData360Options,
+  ExportManifest,
   ExtractedData360Package,
   GetContextOptions,
   UserData360Result,
@@ -16,7 +17,7 @@ import { DATA_CLOUD_FAMILIES } from "./types";
 import { SalesforceAuthBridge, SalesforceAuthorizationError } from "./auth-client";
 import { Data360Extractor } from "./data360-extractor";
 import { B2CacheManager } from "./b2-cache-manager";
-import { claimServiceNonce, readSigHeaders, verifyServiceSignature } from "./service-verify";
+import { claimServiceNonce, readSigHeaders, verifyServiceSignature, verifyRpcEnvelope, type RpcEnvelopeInput, type ServiceSigHeaders } from "./service-verify";
 import { initCache } from "./cache";
 import {
   D1Data360Cache,
@@ -52,6 +53,191 @@ try {
   // Fallback for non-workerd runtimes
 }
 
+/** Corresponding-data implementation shared by the guarded RPC method and the in-process HTTP route. */
+async function getCorrespondingDataImpl(env: Data360Env, options: CorrespondingDataOptions & ExportData360Options): Promise<CorrespondingDataResult> {
+const { userId, channelId, sessionId, bypassCache } = options;
+const d1Cache = new D1Data360Cache(env?.DB);
+const authBridge = new SalesforceAuthBridge(env);
+
+let authResult: any = null;
+const getAuth = async () => {
+  if (!authResult) {
+    authResult = await authBridge.resolveToken({
+      ...options,
+      channelId: channelId || options.agentName,
+    });
+  }
+  return authResult;
+};
+
+// 1. Global Data360 Component
+const targetGlobalId = channelId || options.agentName || "default-channel";
+let globalData: any = null;
+let globalEtag: string = "";
+let isGlobalCached = false;
+let globalSource: "d1" | "b2" | "salesforce" = "salesforce";
+
+if (!bypassCache) {
+  globalData = await d1Cache.getGlobalData360(targetGlobalId);
+  if (globalData) {
+    isGlobalCached = true;
+    globalSource = "d1";
+    globalEtag = (await d1Cache.getGlobalETag(targetGlobalId)) || (await computeETag(globalData));
+  }
+}
+
+if (!globalData) {
+  const b2CacheManager = createB2CacheManager(env);
+  const b2Snapshot = options.orgId
+    ? await b2CacheManager.getLatestSnapshot(options.orgId, targetGlobalId).catch(() => null)
+    : null;
+  if (b2Snapshot && !bypassCache) {
+    globalData = b2Snapshot;
+    globalSource = "b2";
+  } else {
+    try {
+      const auth = await getAuth();
+      const extractor = new Data360Extractor(undefined, undefined, undefined, b2CacheManager);
+      globalData = await extractor.extractData360(auth.connection, {
+        ...options,
+        channelId: targetGlobalId,
+      });
+      globalSource = "salesforce";
+    } catch {
+      globalData = { channelId: targetGlobalId, status: "unavailable" };
+    }
+  }
+  globalEtag = await computeETag(globalData);
+  await d1Cache.putGlobalData360(targetGlobalId, globalData, {
+    orgId: options.orgId || authResult?.connection?.orgId,
+    etag: globalEtag,
+  });
+}
+
+// 2. Individual Data360 Component
+let userData: any = null;
+let userEtag: string = "";
+let isUserCached = false;
+let userSource: "d1" | "salesforce" = "salesforce";
+
+if (!bypassCache) {
+  userData = await d1Cache.getUser(userId);
+  if (userData) {
+    isUserCached = true;
+    userSource = "d1";
+    userEtag = (await d1Cache.getUserETag(userId)) || (await computeETag(userData));
+  }
+}
+
+if (!userData) {
+  try {
+    const auth = await getAuth();
+    const b2CacheManager = createB2CacheManager(env);
+    const extractor = new Data360Extractor(undefined, undefined, undefined, b2CacheManager);
+    userData = await extractor.extractUserData360(auth.connection, userId, options);
+    userSource = "salesforce";
+  } catch {
+    userData = { userId, extractedAt: new Date().toISOString() };
+  }
+  userEtag = await computeETag(userData);
+  await d1Cache.putUser(userId, userData, {
+    orgId: options.orgId || authResult?.connection?.orgId,
+    etag: userEtag,
+  });
+}
+
+// 3. Conversation History Component
+let convData: any = null;
+let convEtag: string = "";
+let isConvCached = false;
+let convSource: "d1" | "auth_service" | "salesforce" = "auth_service";
+
+if (!bypassCache) {
+  convData = await d1Cache.getConversationHistory(userId);
+  if (convData) {
+    isConvCached = true;
+    convSource = "d1";
+    convEtag = (await d1Cache.getConversationETag(userId)) || (await computeETag(convData));
+  }
+}
+
+if (!convData) {
+  try {
+    convData = await authBridge.getUserConversationHistory(userId, {
+      channelId,
+      currentSessionId: sessionId,
+      teamId: options.teamId,
+      orgId: options.orgId,
+    });
+    if (convData) {
+      convSource = "auth_service";
+    }
+  } catch {
+    convData = null;
+  }
+  if (!convData) {
+    convData = {
+      userId,
+      sessions: [],
+      totalSessions: 0,
+      totalMessages: 0,
+      extractedAt: new Date().toISOString(),
+    };
+  }
+  convEtag = await computeETag(convData);
+  await d1Cache.putConversationHistory(userId, convData, {
+    orgId: options.orgId || authResult?.connection?.orgId,
+    etag: convEtag,
+  });
+}
+
+// 4. Compute composite ETag across the 3 independent components
+const compositeETag = await computeETag(`${globalEtag}:${userEtag}:${convEtag}`);
+
+return {
+  ok: true,
+  userId,
+  channelId: channelId ?? "",
+  sessionId,
+  compositeETag,
+  cacheBreakdown: {
+    globalData360: { cached: isGlobalCached, etag: globalEtag, source: globalSource },
+    individualData360: { cached: isUserCached, etag: userEtag, source: userSource },
+    conversationHistory: {
+      cached: isConvCached,
+      etag: convEtag,
+      source: convSource,
+      sessionCount: Array.isArray(convData?.sessions) ? convData.sessions.length : 0,
+      totalMessages: convData?.totalMessages ?? 0,
+    },
+  },
+  globalData360: globalData,
+  individualData360: userData,
+  conversationHistory: convData,
+  timestamp: new Date().toISOString(),
+};
+}
+
+/**
+ * Refresh resume decision from a prior manifest. Returns a validated resume
+ * handle when a previous refresh left an agent retrieve running, else null.
+ * Malformed handles are dropped (fresh retrieve) rather than trusted.
+ */
+export function decideRefreshResume(manifest: ExportManifest | undefined | null): { asyncId: string; apiVersion: string } | null {
+  const pending = manifest?.pendingAgentRetrieve;
+  if (pending && /^[A-Za-z0-9]{15,18}$/.test(pending.asyncId) && /^\d{1,3}\.\d{1,2}$/.test(pending.apiVersion)) {
+    return { asyncId: pending.asyncId, apiVersion: pending.apiVersion };
+  }
+  return null;
+}
+
+/** RPC caller auth: HMAC mesh envelope over the method name + JSON args. Fails closed. */
+async function requireData360RpcAuth(env: Data360Env, method: string, args: unknown, auth: RpcEnvelopeInput | undefined): Promise<void> {
+  const keys = [env.DATA360_INTERNAL_KEY, env.DATA360_INTERNAL_KEY_NEXT].filter((k): k is string => typeof k === "string");
+  const ok = await verifyRpcEnvelope(keys, env.DB, method, args, auth);
+  if (!ok) throw Object.assign(new Error("data360_rpc_unauthorized"), { status: 401 });
+}
+
 export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   constructor(ctx: any, env: any) {
     super(ctx, env);
@@ -60,10 +246,12 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
     initCache(env?.DATA360_KV);
   }
 
+
   /**
    * RPC method: returns the exported Data 360 zip as Uint8Array bytes.
    */
-  async exportData360Zip(options: ExportData360Options): Promise<Uint8Array> {
+  async exportData360Zip(options: ExportData360Options, auth?: ServiceSigHeaders): Promise<Uint8Array> {
+    await requireData360RpcAuth(this.env as Data360Env, "exportData360Zip", [options], auth);
     const authBridge = new SalesforceAuthBridge(this.env);
     const authResult = await authBridge.resolveToken(options);
     const b2CacheManager = createB2CacheManager(this.env);
@@ -81,7 +269,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: returns the uncompressed ExtractedData360Package object.
    */
-  async extractData360(options: ExportData360Options): Promise<ExtractedData360Package> {
+  async extractData360(options: ExportData360Options, auth?: ServiceSigHeaders): Promise<ExtractedData360Package> {
+    await requireData360RpcAuth(this.env as Data360Env, "extractData360", [options], auth);
     const authBridge = new SalesforceAuthBridge(this.env);
     const authResult = await authBridge.resolveToken(options);
     const b2CacheManager = createB2CacheManager(this.env);
@@ -92,7 +281,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: returns the latest cached snapshot summary from B2.
    */
-  async getLatestCache(options: ExportData360Options): Promise<any> {
+  async getLatestCache(options: ExportData360Options, auth?: ServiceSigHeaders): Promise<any> {
+    await requireData360RpcAuth(this.env as Data360Env, "getLatestCache", [options], auth);
     const b2CacheManager = createB2CacheManager(this.env);
     const targetId = options.channelId || options.agentName || "data360";
     const orgId = (await new SalesforceAuthBridge(this.env).resolveToken(options)).connection.orgId!;
@@ -113,7 +303,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
     crmEntity?: string;
     file?: string;
     snapshotId?: string;
-  }): Promise<any> {
+  }, auth?: ServiceSigHeaders): Promise<any> {
+    await requireData360RpcAuth(this.env as Data360Env, "queryCache", [options], auth);
     const b2CacheManager = createB2CacheManager(this.env);
     const targetId = options.channelId || options.agentName || "data360";
     const orgId = (await new SalesforceAuthBridge(this.env).resolveToken(options)).connection.orgId!;
@@ -128,7 +319,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
     channelId?: string;
     agentName?: string;
     snapshotId?: string;
-  }): Promise<Uint8Array | null> {
+  }, auth?: ServiceSigHeaders): Promise<Uint8Array | null> {
+    await requireData360RpcAuth(this.env as Data360Env, "downloadCachedZip", [options], auth);
     const b2CacheManager = createB2CacheManager(this.env);
     const targetId = options.channelId || options.agentName || "data360";
     const orgId = (await new SalesforceAuthBridge(this.env).resolveToken(options)).connection.orgId!;
@@ -138,7 +330,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: lists snapshot summaries for a given target from B2.
    */
-  async listSnapshots(options: ExportData360Options): Promise<any[]> {
+  async listSnapshots(options: ExportData360Options, auth?: ServiceSigHeaders): Promise<any[]> {
+    await requireData360RpcAuth(this.env as Data360Env, "listSnapshots", [options], auth);
     const b2CacheManager = createB2CacheManager(this.env);
     const targetId = options.channelId || options.agentName || "data360";
     const orgId = (await new SalesforceAuthBridge(this.env).resolveToken(options)).connection.orgId!;
@@ -150,8 +343,10 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
    */
   async getUserData360(
     userId: string,
-    options?: ExportData360Options & { bypassCache?: boolean }
+    options?: ExportData360Options & { bypassCache?: boolean },
+    auth?: ServiceSigHeaders
   ): Promise<UserData360Result> {
+    await requireData360RpcAuth(this.env as Data360Env, "getUserData360", [userId, options], auth);
     const d1Cache = new D1Data360Cache(this.env?.DB);
     if (!options?.bypassCache) {
       const cached = await d1Cache.getUser(userId);
@@ -180,8 +375,10 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   async saveUserData360(
     userId: string,
     data: any,
-    options?: { orgId?: string; ttlSeconds?: number }
+    options?: { orgId?: string; ttlSeconds?: number },
+    auth?: ServiceSigHeaders
   ): Promise<{ ok: boolean; userId: string; purgedTag: string }> {
+    await requireData360RpcAuth(this.env as Data360Env, "saveUserData360", [userId, data, options], auth);
     const orgId = options?.orgId || `user-${userId}`;
     const d1Cache = new D1Data360Cache(this.env?.DB);
     const etag = await computeETag(data);
@@ -205,8 +402,10 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
    */
   async getMessagingSessionData360(
     sessionId: string,
-    options?: ExportData360Options & { bypassCache?: boolean }
+    options?: ExportData360Options & { bypassCache?: boolean },
+    auth?: ServiceSigHeaders
   ): Promise<MessagingSessionData360Result> {
+    await requireData360RpcAuth(this.env as Data360Env, "getMessagingSessionData360", [sessionId, options], auth);
     const d1Cache = new D1Data360Cache(this.env?.DB);
     if (!options?.bypassCache) {
       const cached = await d1Cache.getSession(sessionId);
@@ -235,8 +434,10 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   async saveMessagingSessionData360(
     sessionId: string,
     data: any,
-    options?: { orgId?: string; ttlSeconds?: number }
+    options?: { orgId?: string; ttlSeconds?: number },
+    auth?: ServiceSigHeaders
   ): Promise<{ ok: boolean; sessionId: string; purgedTag: string }> {
+    await requireData360RpcAuth(this.env as Data360Env, "saveMessagingSessionData360", [sessionId, data, options], auth);
     const orgId = options?.orgId || `session-${sessionId}`;
     const d1Cache = new D1Data360Cache(this.env?.DB);
     const etag = await computeETag(data);
@@ -258,7 +459,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: purges Declarative Workers Cache / edge cache by tags.
    */
-  async purgeCache(tags: string | string[]): Promise<{ ok: boolean; tags: string[] }> {
+  async purgeCache(tags: string | string[], auth?: ServiceSigHeaders): Promise<{ ok: boolean; tags: string[] }> {
+    await requireData360RpcAuth(this.env as Data360Env, "purgeCache", [tags], auth);
     const tagList = Array.isArray(tags) ? tags : [tags];
     const ok = await purgeEdgeCache(this.ctx, tagList);
     return { ok: ok !== false, tags: tagList };
@@ -267,7 +469,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: retrieves stored ETag for a user for fast 0-stale conditional validation.
    */
-  async getUserETag(userId: string): Promise<string | null> {
+  async getUserETag(userId: string, auth?: ServiceSigHeaders): Promise<string | null> {
+    await requireData360RpcAuth(this.env as Data360Env, "getUserETag", [userId], auth);
     const d1Cache = new D1Data360Cache(this.env?.DB);
     return d1Cache.getUserETag(userId);
   }
@@ -275,7 +478,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: retrieves stored ETag for a session for fast 0-stale conditional validation.
    */
-  async getSessionETag(sessionId: string): Promise<string | null> {
+  async getSessionETag(sessionId: string, auth?: ServiceSigHeaders): Promise<string | null> {
+    await requireData360RpcAuth(this.env as Data360Env, "getSessionETag", [sessionId], auth);
     const d1Cache = new D1Data360Cache(this.env?.DB);
     return d1Cache.getSessionETag(sessionId);
   }
@@ -283,7 +487,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: retrieves stored ETag for a user's conversation history for fast 0-stale conditional validation.
    */
-  async getConversationETag(userId: string): Promise<string | null> {
+  async getConversationETag(userId: string, auth?: ServiceSigHeaders): Promise<string | null> {
+    await requireData360RpcAuth(this.env as Data360Env, "getConversationETag", [userId], auth);
     const d1Cache = new D1Data360Cache(this.env?.DB);
     return d1Cache.getConversationETag(userId);
   }
@@ -291,7 +496,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: retrieves stored ETag for global Data 360 for fast 0-stale conditional validation.
    */
-  async getGlobalETag(targetId: string): Promise<string | null> {
+  async getGlobalETag(targetId: string, auth?: ServiceSigHeaders): Promise<string | null> {
+    await requireData360RpcAuth(this.env as Data360Env, "getGlobalETag", [targetId], auth);
     const d1Cache = new D1Data360Cache(this.env?.DB);
     return d1Cache.getGlobalETag(targetId);
   }
@@ -301,176 +507,19 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
    * with independent smart component caching to maximize cache hits.
    */
   async getCorrespondingData(
-    options: CorrespondingDataOptions & ExportData360Options
+    options: CorrespondingDataOptions & ExportData360Options,
+    auth?: ServiceSigHeaders
   ): Promise<CorrespondingDataResult> {
-    const { userId, channelId, sessionId, bypassCache } = options;
-    const d1Cache = new D1Data360Cache(this.env?.DB);
-    const authBridge = new SalesforceAuthBridge(this.env);
-
-    let authResult: any = null;
-    const getAuth = async () => {
-      if (!authResult) {
-        authResult = await authBridge.resolveToken({
-          ...options,
-          channelId: channelId || options.agentName,
-        });
-      }
-      return authResult;
-    };
-
-    // 1. Global Data360 Component
-    const targetGlobalId = channelId || options.agentName || "default-channel";
-    let globalData: any = null;
-    let globalEtag: string = "";
-    let isGlobalCached = false;
-    let globalSource: "d1" | "b2" | "salesforce" = "salesforce";
-
-    if (!bypassCache) {
-      globalData = await d1Cache.getGlobalData360(targetGlobalId);
-      if (globalData) {
-        isGlobalCached = true;
-        globalSource = "d1";
-        globalEtag = (await d1Cache.getGlobalETag(targetGlobalId)) || (await computeETag(globalData));
-      }
-    }
-
-    if (!globalData) {
-      const b2CacheManager = createB2CacheManager(this.env);
-      const b2Snapshot = options.orgId
-        ? await b2CacheManager.getLatestSnapshot(options.orgId, targetGlobalId).catch(() => null)
-        : null;
-      if (b2Snapshot && !bypassCache) {
-        globalData = b2Snapshot;
-        globalSource = "b2";
-      } else {
-        try {
-          const auth = await getAuth();
-          const extractor = new Data360Extractor(undefined, undefined, undefined, b2CacheManager);
-          globalData = await extractor.extractData360(auth.connection, {
-            ...options,
-            channelId: targetGlobalId,
-          });
-          globalSource = "salesforce";
-        } catch {
-          globalData = { channelId: targetGlobalId, status: "unavailable" };
-        }
-      }
-      globalEtag = await computeETag(globalData);
-      await d1Cache.putGlobalData360(targetGlobalId, globalData, {
-        orgId: options.orgId || authResult?.connection?.orgId,
-        etag: globalEtag,
-      });
-    }
-
-    // 2. Individual Data360 Component
-    let userData: any = null;
-    let userEtag: string = "";
-    let isUserCached = false;
-    let userSource: "d1" | "salesforce" = "salesforce";
-
-    if (!bypassCache) {
-      userData = await d1Cache.getUser(userId);
-      if (userData) {
-        isUserCached = true;
-        userSource = "d1";
-        userEtag = (await d1Cache.getUserETag(userId)) || (await computeETag(userData));
-      }
-    }
-
-    if (!userData) {
-      try {
-        const auth = await getAuth();
-        const b2CacheManager = createB2CacheManager(this.env);
-        const extractor = new Data360Extractor(undefined, undefined, undefined, b2CacheManager);
-        userData = await extractor.extractUserData360(auth.connection, userId, options);
-        userSource = "salesforce";
-      } catch {
-        userData = { userId, extractedAt: new Date().toISOString() };
-      }
-      userEtag = await computeETag(userData);
-      await d1Cache.putUser(userId, userData, {
-        orgId: options.orgId || authResult?.connection?.orgId,
-        etag: userEtag,
-      });
-    }
-
-    // 3. Conversation History Component
-    let convData: any = null;
-    let convEtag: string = "";
-    let isConvCached = false;
-    let convSource: "d1" | "auth_service" | "salesforce" = "auth_service";
-
-    if (!bypassCache) {
-      convData = await d1Cache.getConversationHistory(userId);
-      if (convData) {
-        isConvCached = true;
-        convSource = "d1";
-        convEtag = (await d1Cache.getConversationETag(userId)) || (await computeETag(convData));
-      }
-    }
-
-    if (!convData) {
-      try {
-        convData = await authBridge.getUserConversationHistory(userId, {
-          channelId,
-          currentSessionId: sessionId,
-          teamId: options.teamId,
-          orgId: options.orgId,
-        });
-        if (convData) {
-          convSource = "auth_service";
-        }
-      } catch {
-        convData = null;
-      }
-      if (!convData) {
-        convData = {
-          userId,
-          sessions: [],
-          totalSessions: 0,
-          totalMessages: 0,
-          extractedAt: new Date().toISOString(),
-        };
-      }
-      convEtag = await computeETag(convData);
-      await d1Cache.putConversationHistory(userId, convData, {
-        orgId: options.orgId || authResult?.connection?.orgId,
-        etag: convEtag,
-      });
-    }
-
-    // 4. Compute composite ETag across the 3 independent components
-    const compositeETag = await computeETag(`${globalEtag}:${userEtag}:${convEtag}`);
-
-    return {
-      ok: true,
-      userId,
-      channelId: channelId ?? "",
-      sessionId,
-      compositeETag,
-      cacheBreakdown: {
-        globalData360: { cached: isGlobalCached, etag: globalEtag, source: globalSource },
-        individualData360: { cached: isUserCached, etag: userEtag, source: userSource },
-        conversationHistory: {
-          cached: isConvCached,
-          etag: convEtag,
-          source: convSource,
-          sessionCount: Array.isArray(convData?.sessions) ? convData.sessions.length : 0,
-          totalMessages: convData?.totalMessages ?? 0,
-        },
-      },
-      globalData360: globalData,
-      individualData360: userData,
-      conversationHistory: convData,
-      timestamp: new Date().toISOString(),
-    };
+    await requireData360RpcAuth(this.env as Data360Env, "getCorrespondingData", [options], auth);
+    return getCorrespondingDataImpl(this.env as Data360Env, options);
   }
 
   /**
    * RPC method: returns the pure Context required by tubot-agentcode:
    * precompiledAgent, customerData, conversationHistory, globalData, toolCallUrls.
    */
-  async getContext(options: GetContextOptions): Promise<Context> {
+  async getContext(options: GetContextOptions, auth?: ServiceSigHeaders): Promise<Context> {
+    await requireData360RpcAuth(this.env as Data360Env, "getContext", [options], auth);
     const res = await assembleContext(this.env, this.ctx, options);
     return res.context;
   }
@@ -478,14 +527,16 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: returns Context with caching breakdown and composite ETag.
    */
-  async getContextWithMeta(options: GetContextOptions): Promise<ContextResult> {
+  async getContextWithMeta(options: GetContextOptions, auth?: ServiceSigHeaders): Promise<ContextResult> {
+    await requireData360RpcAuth(this.env as Data360Env, "getContextWithMeta", [options], auth);
     return assembleContext(this.env, this.ctx, options);
   }
 
   /**
    * RPC method: retrieves precompiled agent code (smartly cached).
    */
-  async getAgentCode(agentKey: string): Promise<any> {
+  async getAgentCode(agentKey: string, auth?: ServiceSigHeaders): Promise<any> {
+    await requireData360RpcAuth(this.env as Data360Env, "getAgentCode", [agentKey], auth);
     const d1Cache = new D1Data360Cache(this.env?.DB);
     return d1Cache.getAgentCode(agentKey);
   }
@@ -493,7 +544,8 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
   /**
    * RPC method: retrieves callable tool proxy URLs (smartly cached).
    */
-  async getToolUrls(channelId: string): Promise<string[]> {
+  async getToolUrls(channelId: string, auth?: ServiceSigHeaders): Promise<string[]> {
+    await requireData360RpcAuth(this.env as Data360Env, "getToolUrls", [channelId], auth);
     const d1Cache = new D1Data360Cache(this.env?.DB);
     const urls = await d1Cache.getToolUrls(channelId);
     return urls || [];
@@ -1353,10 +1405,9 @@ export default {
       };
       parseHeadersForAuth(request, options);
 
-      const entrypoint = new TubotSfData360Entrypoint(ctx || ({} as any), env);
       let result: CorrespondingDataResult;
       try {
-        result = await entrypoint.getCorrespondingData(options);
+        result = await getCorrespondingDataImpl(env, options);
       } catch (err: unknown) {
         return Response.json(
           {
@@ -1808,6 +1859,55 @@ export default {
       );
     }
 
+    // Cached agent definition reads. HMAC-signed service requests only (no
+    // legacy bearer: these routes are new). Serves the content-addressed
+    // blobs written at refresh; callers enforce tenant scope before reading.
+    if ((path === "/api/cache/agent" || path === "/api/cache/agents") && request.method === "GET") {
+      const keys = [env.DATA360_INTERNAL_KEY, env.DATA360_INTERNAL_KEY_NEXT].filter(
+        (k): k is string => typeof k === "string" && k.length >= 32,
+      );
+      if (keys.length === 0 || !env.DB) {
+        return Response.json({ error: "data360_unconfigured" }, { status: 503 });
+      }
+      const nowSec = Math.floor(Date.now() / 1000);
+      const sig = readSigHeaders(request.headers);
+      const ok = sig &&
+        (await verifyServiceSignature(keys, request.method, path, "", sig, nowSec)) &&
+        (await claimServiceNonce(env.DB, sig.nonce, nowSec));
+      if (!ok) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      const mgr = createB2CacheManager(env);
+      const orgId = url.searchParams.get("orgId") ?? "";
+      try {
+        if (path === "/api/cache/agents") {
+          return Response.json({ orgId, agents: await mgr.listAgentPointers(orgId) });
+        }
+        const agent = url.searchParams.get("agent") ?? "";
+        const pointer = await mgr.readAgentPointer(orgId, agent);
+        if (!pointer) {
+          return Response.json({ error: "agent_not_cached" }, { status: 404 });
+        }
+        const blob = await mgr.downloadAgentBlob(pointer.sha);
+        if (!blob) {
+          return Response.json({ error: "agent_not_cached" }, { status: 404 });
+        }
+        return Response.json({
+          agent, orgId, sha: pointer.sha, files: blob.files,
+          snapshotId: pointer.snapshotId, updatedAt: pointer.updatedAt,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.startsWith("Invalid B2 agent blob scope")) {
+          return Response.json({ error: "invalid_request", message }, { status: 400 });
+        }
+        if (message === "agent blob sha mismatch") {
+          return Response.json({ error: "agent_blob_corrupt" }, { status: 502 });
+        }
+        throw error;
+      }
+    }
+
     // Export & Refresh Endpoints
     if (path === "/export" || path === "/api/export" || path === "/cache/refresh" || path === "/api/cache/refresh") {
       const isRefresh = path === "/cache/refresh" || path === "/api/cache/refresh";
@@ -1895,10 +1995,14 @@ export default {
         // unstructured file bytes. Per-file downloads (plus their redirect hops)
         // exhaust the per-invocation subrequest budget before the B2 save runs;
         // refresh snapshots carry records+metadata, file bytes stay in /export.
+        // Agent artifacts are always captured: snapshots double as the agent
+        // definition cache for downstream readers.
         if (isRefresh) {
           options.cacheToB2 = true;
           options.format = "json";
           options.includeUnstructuredFiles = false;
+          options.includeAgentScript = true;
+          options.includeAgentXml = true;
         }
 
         parseHeadersForAuth(request, options);
@@ -1915,6 +2019,9 @@ export default {
 
         // Recency short-circuit: skip re-extraction when the latest tenant-scoped
         // snapshot is fresh (<=6h old). Any lookup failure falls through to extraction.
+        // A snapshot with a pending agent retrieve (or no agent artifacts at
+        // all) is never "fresh": fall through and resume/extract instead of
+        // serving a deduped agentless snapshot for 6 more hours.
         if (isRefresh) {
           const refreshTargetId = (options.channelId || options.agentName || "").trim();
           const refreshOrgId = options.orgId || refreshTargetId;
@@ -1923,7 +2030,11 @@ export default {
               const recencyCacheMgr = createB2CacheManager(env);
               const latest = await recencyCacheMgr.getLatestSnapshot(refreshOrgId, refreshTargetId);
               const latestTs = latest ? Date.parse(latest.timestamp || "") : NaN;
-              if (latest && !Number.isNaN(latestTs) && Date.now() - latestTs <= REFRESH_RECENCY_WINDOW_MS) {
+              const resume = decideRefreshResume(latest?.manifest);
+              if (resume) options.resumeAgentRetrieve = resume;
+              const agentMissing = latest?.manifest?.summary?.agentFormat === "unknown" && !options.resumeAgentRetrieve;
+              if (latest && !Number.isNaN(latestTs) && Date.now() - latestTs <= REFRESH_RECENCY_WINDOW_MS &&
+                !options.resumeAgentRetrieve && !agentMissing) {
                 const dedupedCache = latest.manifest?.b2Cache ?? {
                   stored: true,
                   bucketName: "",
@@ -1969,8 +2080,15 @@ export default {
         const extractor = new Data360Extractor(undefined, undefined, undefined, cacheMgr);
         const pkg = await extractor.extractData360(authResult.connection, options);
 
-        // If called via /cache/refresh, return confirmation and cache metadata
+        // If called via /cache/refresh, return confirmation and cache metadata.
+        // Refresh exists to cache: an unstored package is a failure, not a confirmation.
         if (isRefresh) {
+          if (pkg.b2Cache?.stored === false) {
+            return Response.json(
+              { ok: false, error: "data360_cache_failed", cache: pkg.b2Cache, manifest: pkg.manifest },
+              { status: 502 }
+            );
+          }
           return Response.json(
             {
               ok: true,

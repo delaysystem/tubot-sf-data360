@@ -9,6 +9,24 @@ import type {
 } from "./types";
 import { DATA_CLOUD_FAMILIES } from "./types";
 
+/** Bounded-concurrency task pool; stops scheduling after the first failure. */
+async function runPool(tasks: Array<() => Promise<void>>, concurrency: number): Promise<void> {
+  const queue = [...tasks];
+  let failed: unknown = null;
+  const workers = Array.from({ length: Math.min(Math.max(concurrency, 1), queue.length) }, async () => {
+    while (queue.length > 0 && failed === null) {
+      const task = queue.shift()!;
+      try {
+        await task();
+      } catch (error) {
+        failed ??= error;
+      }
+    }
+  });
+  await Promise.all(workers);
+  if (failed !== null) throw failed;
+}
+
 export interface B2FileEntry {
   fileId?: string;
   fileName: string;
@@ -487,7 +505,7 @@ export class B2CacheManager {
   /** Publish a tenant-scoped snapshot only after every family object is stored. */
   async savePackage(
     pkg: ExtractedData360Package,
-    options?: { ttlSeconds?: number; snapshotId?: string; orgId?: string; targetId?: string }
+    options?: { ttlSeconds?: number; snapshotId?: string; orgId?: string; targetId?: string; sweepOrphans?: boolean }
   ): Promise<B2CacheMetadata> {
     const orgId = options?.orgId || extractOrgId(pkg);
     const targetIdentifier = options?.targetId || extractTargetIdentifier(pkg);
@@ -518,25 +536,32 @@ export class B2CacheManager {
     // Packages from older callers still contain valid rows without the new catalog.
     for (const name of Object.keys(pkg.records.dataCloud)) objectFamilies[name] ??= "dmo";
     for (const name of Object.keys(pkg.records.dataGraphs ?? {})) objectFamilies[name] = "data-graph";
+    // Phase A: independent objects upload with bounded concurrency (manifest
+    // and latest.json still publish last as the atomicity gate).
+    const phaseA: Array<() => Promise<void>> = [];
     for (const family of DATA_CLOUD_FAMILIES) {
       const objects = descriptors.filter(o => o.family === family);
       const source = family === "data-graph" ? pkg.records.dataGraphs ?? {} : pkg.records.dataCloud;
       const rows = Object.fromEntries(Object.entries(source).filter(([name]) => objectFamilies[name] === family));
       const metadata = objects.length ? objects.map(o => ({ ...o.metadata, dataSpace: o.dataSpace, storageKey: o.storageKey }))
         : metadataFallback[family] ?? [];
-      await json(`data/${family}.json`, { metadata, rows });
+      phaseA.push(() => json(`data/${family}.json`, { metadata, rows }));
     }
     const { dataCloudObjects, dataLakeObjects, dataModelObjects, dataGraphs,
       calculatedInsights, dmoDescribes, ...context } = pkg.metadata;
-    await json("metadata/context.json", { metadata: context, agent: pkg.agent });
-    await json("data/crm.json", pkg.records.crm);
-    const fileIndex = [];
+    phaseA.push(() => json("metadata/context.json", { metadata: context, agent: pkg.agent }));
+    phaseA.push(() => json("data/crm.json", pkg.records.crm));
+    const fileIndex: unknown[] = [];
     for (const file of pkg.unstructuredFiles ?? []) {
       const path = `files/${encodeURIComponent(file.category)}/${encodeURIComponent(file.id)}/${encodeURIComponent(file.filename)}`;
       const { data, ...metadata } = file;
-      await upload(path, data instanceof Uint8Array ? data : new Uint8Array(data), file.contentType || "application/octet-stream");
-      fileIndex.push({ ...metadata, path });
+      phaseA.push(async () => {
+        await upload(path, data instanceof Uint8Array ? data : new Uint8Array(data), file.contentType || "application/octet-stream");
+        fileIndex.push({ ...metadata, path });
+      });
     }
+    await runPool(phaseA, 4);
+    // Phase B: file index (depends on phase A), then the publish gate.
     await json("metadata/files.json", fileIndex);
     pkg.manifest.storage = { layoutVersion: 3, objectFamilies,
       objectDataSpaces: Object.fromEntries(descriptors.map(o => [o.storageKey, o.dataSpace])), files };
@@ -565,7 +590,141 @@ export class B2CacheManager {
       totalBytes: metadata.totalBytes, fileCount: metadata.fileCount,
     };
     await this.doUpload(`${this.rootPrefix()}/${orgId}/${targetIdentifier}/latest.json`, JSON.stringify(summary), "application/json");
+    if (options?.sweepOrphans) {
+      try {
+        const swept = await this.sweepOrphanSnapshots(orgId, targetIdentifier, new Set([snapshotId]));
+        if (swept.deletedSnapshots.length > 0) {
+          (pkg.manifest.warnings ??= []).push(`Swept ${swept.deletedSnapshots.length} orphan snapshot(s): ${swept.deletedSnapshots.join(", ")}.`);
+        }
+      } catch (error) {
+        (pkg.manifest.warnings ??= []).push(`Orphan sweep skipped: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     return metadata;
+  }
+
+  /**
+   * Deletes snapshot prefixes that never published (no manifest.json) and are
+   * older than `olderThanMs`. Published history is never touched; unknown
+   * timestamps fail safe (kept). Best-effort hygiene for crashed saves.
+   */
+  async sweepOrphanSnapshots(
+    orgId: string, targetId: string, keep: Set<string> = new Set(), olderThanMs = 3_600_000,
+  ): Promise<{ deletedSnapshots: string[]; deletedFiles: number }> {
+    if (!/^[A-Za-z0-9_-]+$/.test(orgId) || !/^[A-Za-z0-9_-]+$/.test(targetId)) throw new Error("Invalid B2 snapshot scope");
+    const deleter = (this.b2Client as any)?.deleteFileVersion;
+    if (typeof deleter !== "function") throw new Error("b2Client does not implement deleteFileVersion");
+    const listed: any = await this.doListFiles(`${this.rootPrefix()}/${orgId}/${targetId}/snapshots/`);
+    const files: any[] = Array.isArray(listed?.files) ? listed.files : Array.isArray(listed) ? listed : [];
+    const groups = new Map<string, Array<{ fileId: string; fileName: string; uploadTimestamp?: number }>>();
+    for (const file of files) {
+      const name = typeof file?.fileName === "string" ? file.fileName : "";
+      const match = name.match(/\/snapshots\/([^/]+)\//);
+      if (!match || typeof file?.fileId !== "string") continue;
+      const group = groups.get(match[1]) ?? [];
+      group.push({ fileId: file.fileId, fileName: name, uploadTimestamp: file.uploadTimestamp });
+      groups.set(match[1], group);
+    }
+    const deletedSnapshots: string[] = [];
+    let deletedFiles = 0;
+    const cutoff = Date.now() - olderThanMs;
+    for (const [snapshotId, group] of groups) {
+      if (keep.has(snapshotId)) continue;
+      if (group.some(f => f.fileName.endsWith("/manifest.json"))) continue;
+      const newest = Math.max(...group.map(f => typeof f.uploadTimestamp === "number" ? f.uploadTimestamp : NaN));
+      if (Number.isNaN(newest) || newest > cutoff) continue;
+      for (const file of group) {
+        await deleter.call(this.b2Client, { fileName: file.fileName, fileId: file.fileId });
+        deletedFiles++;
+      }
+      deletedSnapshots.push(snapshotId);
+    }
+    return { deletedSnapshots, deletedFiles };
+  }
+
+  /**
+   * Content-addressed agent definition blobs. One immutable blob per agent
+   * (`blobs/sha256/<hex>` = canonical `{files}` JSON) plus a mutable pointer
+   * (`agents/<orgId>/<agent>/latest.json`). Team scoping lives in the
+   * reader-side index; blobs are safe to share because the sha names the bytes.
+   */
+  private static agentScopeError(label: string): Error {
+    return new Error(`Invalid B2 agent blob scope: ${label}`);
+  }
+
+  private static checkAgentScope(orgId: string, agent: string): void {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(orgId)) throw B2CacheManager.agentScopeError("org");
+    if (!/^[A-Za-z0-9_.-]{1,128}$/.test(agent) || agent.includes("..")) throw B2CacheManager.agentScopeError("agent");
+  }
+
+  private static canonicalFilesJson(files: Record<string, string>): string {
+    const sorted = Object.keys(files).sort().map(k => `${JSON.stringify(k)}:${JSON.stringify(files[k])}`);
+    return `{"files":{${sorted.join(",")}}}`;
+  }
+
+  async saveAgentBlob(
+    orgId: string, agent: string, files: Record<string, string>, snapshotId?: string,
+  ): Promise<{ sha: string; bytes: number; files: string[] }> {
+    B2CacheManager.checkAgentScope(orgId, agent);
+    const canonical = B2CacheManager.canonicalFilesJson(files);
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+    const sha = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+    const doc = JSON.stringify({
+      version: 1, agent, orgId, sha, files,
+      snapshotId: snapshotId ?? null, writtenAt: new Date().toISOString(),
+    });
+    await this.doUpload(`${this.rootPrefix()}/blobs/sha256/${sha}`, doc, "application/json");
+    await this.doUpload(
+      `${this.rootPrefix()}/agents/${orgId}/${agent}/latest.json`,
+      JSON.stringify({ sha, bytes: doc.length, files: Object.keys(files).sort(), snapshotId: snapshotId ?? null, updatedAt: new Date().toISOString() }),
+      "application/json",
+    );
+    return { sha, bytes: doc.length, files: Object.keys(files).sort() };
+  }
+
+  async readAgentPointer(orgId: string, agent: string): Promise<{ sha: string; bytes: number; files: string[]; snapshotId: string | null; updatedAt: string } | null> {
+    B2CacheManager.checkAgentScope(orgId, agent);
+    const bytes = await this.doDownload(`${this.rootPrefix()}/agents/${orgId}/${agent}/latest.json`);
+    if (!bytes) return null;
+    try {
+      const pointer = JSON.parse(typeof bytes === "string" ? bytes : new TextDecoder().decode(bytes));
+      if (typeof pointer?.sha !== "string" || !/^[0-9a-f]{64}$/.test(pointer.sha)) return null;
+      return pointer;
+    } catch {
+      return null;
+    }
+  }
+
+  async downloadAgentBlob(sha: string): Promise<{ agent: string; orgId: string; files: Record<string, string> } | null> {
+    if (!/^[0-9a-f]{64}$/.test(sha)) throw B2CacheManager.agentScopeError("sha");
+    const bytes = await this.doDownload(`${this.rootPrefix()}/blobs/sha256/${sha}`);
+    if (!bytes) return null;
+    try {
+      const doc = JSON.parse(typeof bytes === "string" ? bytes : new TextDecoder().decode(bytes));
+      if (doc?.version !== 1 || typeof doc?.files !== "object" || !doc.files) return null;
+      const canonical = B2CacheManager.canonicalFilesJson(doc.files);
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+      const actual = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+      if (actual !== sha) throw new Error("agent blob sha mismatch");
+      return { agent: doc.agent, orgId: doc.orgId, files: doc.files };
+    } catch (error) {
+      if (error instanceof Error && error.message === "agent blob sha mismatch") throw error;
+      return null;
+    }
+  }
+
+  /** Agent names with a cached pointer under an org (enumeration for scoped readers). */
+  async listAgentPointers(orgId: string): Promise<string[]> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(orgId)) throw B2CacheManager.agentScopeError("org");
+    const listed: any = await this.doListFiles(`${this.rootPrefix()}/agents/${orgId}/`);
+    const files: any[] = Array.isArray(listed?.files) ? listed.files : Array.isArray(listed) ? listed : [];
+    const agents = new Set<string>();
+    for (const file of files) {
+      const name = typeof file?.fileName === "string" ? file.fileName : typeof file === "string" ? file : "";
+      const match = name.match(/\/agents\/[^/]+\/([^/]+)\/latest\.json$/);
+      if (match && /^[A-Za-z0-9_.-]{1,128}$/.test(match[1]) && !match[1].includes("..")) agents.add(match[1]);
+    }
+    return [...agents].sort();
   }
 
   /**

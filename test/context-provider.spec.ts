@@ -15,6 +15,7 @@ function createMockD1(): { db: D1Database; tables: Map<string, Map<string, any>>
   tables.set("data360_global_cache", new Map());
   tables.set("data360_agent_code_cache", new Map());
   tables.set("data360_tool_urls_cache", new Map());
+  tables.set("salesforce_self_oauth_internal_nonce", new Map());
 
   const db = {
     async exec(_sql: string) {
@@ -42,6 +43,17 @@ function createMockD1(): { db: D1Database; tables: Map<string, Map<string, any>>
             return { success: true, meta: { changes: 0 } };
           }
           for (const [tableName, tableMap] of tables.entries()) {
+            if (lower.includes(`insert or ignore into ${tableName}`)) {
+              if (tableMap.has(boundArgs[0])) return { success: true, meta: { changes: 0 } };
+              tableMap.set(boundArgs[0], { hash: boundArgs[0], expires_at: boundArgs[1] });
+              return { success: true, meta: { changes: 1 } };
+            }
+            if (lower.includes(`delete from ${tableName}`) && tableName.includes("nonce")) {
+              for (const [k, v] of tableMap.entries()) {
+                if ((v as any).expires_at <= boundArgs[0]) tableMap.delete(k);
+              }
+              return { success: true, meta: { changes: 0 } };
+            }
             if (lower.includes(`insert into ${tableName}`)) {
               const key = boundArgs[0];
               tableMap.set(key, {
@@ -90,6 +102,7 @@ describe("tubot-sf-data360 Context Provider & Smart Caching", () => {
     mockD1 = createMockD1();
     mockEnv = {
       DB: mockD1.db,
+      DATA360_INTERNAL_KEY: "mesh-key-0123456789abcdef0123456789abcd",
       SF_AUTH_CALLER_KEY: "test-data360-caller-key-0123456789abcdef",
       TUBOT_SF_AUTH: {
         async getTokenForChannel(channelId: string) {
@@ -227,10 +240,14 @@ describe("tubot-sf-data360 Context Provider & Smart Caching", () => {
   });
 
   it("TubotSfData360Entrypoint RPC getContext returns pure Context", async () => {
+    const { signRpcEnvelope } = await import("../../tubot-new-panel/worker/service-signer");
     const entrypoint = new TubotSfData360Entrypoint({} as any, mockEnv);
-    const context = await entrypoint.getContext({
-      userId: "user-999",
-      channelId: "channel-xyz",
+    const args = [{ userId: "user-999", channelId: "channel-xyz" }];
+    const headers = await signRpcEnvelope(mockEnv.DATA360_INTERNAL_KEY!, "getContext", args);
+    const context = await entrypoint.getContext(args[0], {
+      timestamp: headers["x-tubot-sig-timestamp"],
+      nonce: headers["x-tubot-sig-nonce"],
+      signature: headers["x-tubot-sig-signature"],
     });
 
     expect(context.precompiledAgent).toBeDefined();
@@ -238,6 +255,27 @@ describe("tubot-sf-data360 Context Provider & Smart Caching", () => {
     expect(Array.isArray(context.conversationHistory)).toBe(true);
     expect(context.globalData).toBeDefined();
     expect(Array.isArray(context.toolCallUrls)).toBe(true);
+  });
+
+  it("RPC methods reject missing, replayed, and wrong-key envelopes", async () => {
+    const { signRpcEnvelope } = await import("../../tubot-new-panel/worker/service-signer");
+    const entrypoint = new TubotSfData360Entrypoint({} as any, mockEnv);
+    await expect(entrypoint.getToolUrls("channel-xyz")).rejects.toThrow("data360_rpc_unauthorized");
+    const key = mockEnv.DATA360_INTERNAL_KEY!;
+    const headers = await signRpcEnvelope(key, "getToolUrls", ["channel-xyz"]);
+    const envelope = {
+      timestamp: headers["x-tubot-sig-timestamp"],
+      nonce: headers["x-tubot-sig-nonce"],
+      signature: headers["x-tubot-sig-signature"],
+    };
+    await expect(entrypoint.getToolUrls("channel-xyz", envelope)).resolves.toEqual([]);
+    await expect(entrypoint.getToolUrls("channel-xyz", envelope)).rejects.toThrow("data360_rpc_unauthorized");
+    const forged = await signRpcEnvelope("wrong-key-0123456789abcdef0123456789ab", "getToolUrls", ["channel-xyz"]);
+    await expect(entrypoint.getToolUrls("channel-xyz", {
+      timestamp: forged["x-tubot-sig-timestamp"],
+      nonce: forged["x-tubot-sig-nonce"],
+      signature: forged["x-tubot-sig-signature"],
+    })).rejects.toThrow("data360_rpc_unauthorized");
   });
 
   it("serves REST API POST /api/v1/context with cache headers and composite ETag", async () => {
