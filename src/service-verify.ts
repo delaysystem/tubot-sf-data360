@@ -135,9 +135,21 @@ export async function verifyRpcEnvelope(
     (await claimServiceNonce(db, bare.nonce, nowSec));
 }
 
+const nonceSchemasInitialized = new WeakSet<object>();
+
+/** Idempotent nonce-table DDL (table + expiry index), once per DB handle.
+ * F10: the per-RPC expired-nonce DELETE was an unindexed SCAN scaling with
+ * live nonces; the expires_at index turns it into a SEARCH. */
+export async function ensureNonceSchema(db: NonceDb): Promise<void> {
+  if (!db || typeof db !== "object" || nonceSchemasInitialized.has(db)) return;
+  await db.prepare("CREATE TABLE IF NOT EXISTS salesforce_self_oauth_internal_nonce (nonce_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)").run();
+  await db.prepare("CREATE INDEX IF NOT EXISTS salesforce_self_oauth_internal_nonce_expiry_idx ON salesforce_self_oauth_internal_nonce (expires_at)").run();
+  nonceSchemasInitialized.add(db);
+}
+
 /** Single-use nonce claim. Returns false on replay (or D1 failure fail-closed by caller choice). */
 export async function claimServiceNonce(db: NonceDb, nonce: string, nowSec: number): Promise<boolean> {
-  await db.prepare("CREATE TABLE IF NOT EXISTS salesforce_self_oauth_internal_nonce (nonce_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)").run();
+  await ensureNonceSchema(db);
   const nonceHash = await sha256Hex(`sig-nonce:${nonce}`);
   await db.prepare("DELETE FROM salesforce_self_oauth_internal_nonce WHERE expires_at <= ?").bind(nowSec).run();
   const inserted = await db.prepare(

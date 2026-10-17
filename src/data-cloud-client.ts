@@ -103,7 +103,7 @@ export class DataCloudClient {
   async discover(
     onCatalog?: ((family: string, count: number) => void) | DataCloudDiscoverOptions,
     opts?: DataCloudDiscoverOptions,
-  ): Promise<{ dataSpaces: Row[]; objects: DataCloudObject[]; identityResolutions: Row[]; warnings: string[] }> {
+  ): Promise<{ dataSpaces: Row[]; objects: DataCloudObject[]; identityResolutions: Row[]; warnings: string[]; dataCloudAvailable?: boolean }> {
     const callback = typeof onCatalog === "function" ? onCatalog : undefined;
     const includeObjectSchemas =
       (typeof onCatalog === "object" && onCatalog !== null ? onCatalog.includeObjectSchemas : undefined)
@@ -118,7 +118,9 @@ export class DataCloudClient {
       }
     }
     const result = await this.discoverLive(callback, includeObjectSchemas);
-    if (orgId && !includeObjectSchemas) {
+    // A degraded (Data Cloud unavailable) catalog is never cached: caching an
+    // empty catalog would mask a later-enabled Data Cloud until TTL expiry.
+    if (orgId && !includeObjectSchemas && result.dataCloudAvailable !== false) {
       await cachePutJSON(catalogCacheKey(orgId), {
         dataSpaces: result.dataSpaces, objects: result.objects, identityResolutions: result.identityResolutions,
       }, CACHE_TTL.catalog);
@@ -129,8 +131,24 @@ export class DataCloudClient {
   private async discoverLive(
     onCatalog: ((family: string, count: number) => void) | undefined,
     includeObjectSchemas: boolean,
-  ): Promise<{ dataSpaces: Row[]; objects: DataCloudObject[]; identityResolutions: Row[]; warnings: string[] }> {
-    const dataSpaces = await this.list("data-spaces", "dataSpaces");
+  ): Promise<{ dataSpaces: Row[]; objects: DataCloudObject[]; identityResolutions: Row[]; warnings: string[]; dataCloudAvailable?: boolean }> {
+    let dataSpaces: Row[];
+    try {
+      dataSpaces = await this.list("data-spaces", "dataSpaces");
+    } catch (error) {
+      // Orgs without Data Cloud answer the catalog root with 403/404: degrade
+      // to an empty catalog (warning) instead of failing the whole export.
+      // 401 stays fatal: an expired token must surface, not masquerade as
+      // a missing feature.
+      if (/HTTP (403|404)/.test(String(error))) {
+        return {
+          dataSpaces: [], objects: [], identityResolutions: [],
+          warnings: ["Data Cloud is not available in this org; skipping the Data Cloud catalog."],
+          dataCloudAvailable: false,
+        };
+      }
+      throw error;
+    }
     const objects: DataCloudObject[] = [];
     const seenObjects = new Set<string>();
     const warnings: string[] = [];

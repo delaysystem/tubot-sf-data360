@@ -60,7 +60,7 @@ export class AgentAnalyzer {
 
     // 1. Run batched queries across MessagingChannel, BotDefinition, and Custom Settings
     const queries = [
-      `SELECT Id, DeveloperName, MasterLabel, SessionHandlerId, MessageType, TargetType FROM MessagingChannel WHERE DeveloperName = '${esc}' OR MasterLabel = '${esc}'${idClause} LIMIT 1`,
+      `SELECT Id, DeveloperName, MasterLabel, SessionHandlerId, MessageType, TargetQueueId FROM MessagingChannel WHERE DeveloperName = '${esc}' OR MasterLabel = '${esc}'${idClause} LIMIT 1`,
       `SELECT Id, DeveloperName, MasterLabel FROM BotDefinition WHERE DeveloperName = '${esc}' OR MasterLabel = '${esc}'${idClause} LIMIT 1`,
       `SELECT Id, Name, tubot__Agent_Name__c FROM tubot__Agentforce_Agent_Select__c WHERE Name = '${esc}' OR tubot__Deployment_Label__c = '${esc}' LIMIT 1`,
       `SELECT Id, Name, Agent_Name__c FROM Agentforce_Agent_Select__c WHERE Name = '${esc}' OR Deployment_Label__c = '${esc}' LIMIT 1`,

@@ -213,6 +213,46 @@ describe("DataCloudClient", () => {
     }
   });
 
+  it("degrades to an empty catalog when Data Cloud is unavailable, keeps 401 fatal", async () => {
+    const client = new DataCloudClient(conn, "v68.0");
+    const originalFetch = globalThis.fetch;
+    try {
+      for (const status of [403, 404]) {
+        globalThis.fetch = vi.fn().mockImplementation(async () => new Response("denied", { status }));
+        const catalog = await client.discover();
+        expect(catalog.dataSpaces).toEqual([]);
+        expect(catalog.objects).toEqual([]);
+        expect(catalog.identityResolutions).toEqual([]);
+        expect(catalog.dataCloudAvailable).toBe(false);
+        expect(catalog.warnings).toEqual([
+          "Data Cloud is not available in this org; skipping the Data Cloud catalog.",
+        ]);
+      }
+      globalThis.fetch = vi.fn().mockImplementation(async () => new Response("expired", { status: 401 }));
+      await expect(client.discover()).rejects.toThrow("HTTP 401");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("never caches a degraded catalog, so a later-enabled Data Cloud is visible", async () => {
+    const store = installFakeKV();
+    const client = new DataCloudClient({ ...conn, orgId: "00Dnocloud1" }, "v68.0");
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = vi.fn().mockImplementation(async (url: any) => {
+        if (String(url).includes("data-spaces")) return new Response("denied", { status: 403 });
+        throw new Error(`unexpected catalog url ${String(url)}`);
+      });
+      const catalog = await client.discover();
+      expect(catalog.dataCloudAvailable).toBe(false);
+      expect(store.size).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      initCache(null);
+    }
+  });
+
   it("serves discovery from the catalog cache without fetching", async () => {
     installFakeKV();
     const client = new DataCloudClient({ ...conn, orgId: "00Dcatalog1" }, "v68.0");

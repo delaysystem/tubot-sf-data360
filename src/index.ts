@@ -78,11 +78,12 @@ let isGlobalCached = false;
 let globalSource: "d1" | "b2" | "salesforce" = "salesforce";
 
 if (!bypassCache) {
-  globalData = await d1Cache.getGlobalData360(targetGlobalId);
-  if (globalData) {
+  const globalHit = await d1Cache.getGlobalData360WithETag(targetGlobalId);
+  if (globalHit && globalHit.data) {
+    globalData = globalHit.data;
     isGlobalCached = true;
     globalSource = "d1";
-    globalEtag = (await d1Cache.getGlobalETag(targetGlobalId)) || (await computeETag(globalData));
+    globalEtag = globalHit.etag || (await computeETag(globalData));
   }
 }
 
@@ -121,11 +122,12 @@ let isUserCached = false;
 let userSource: "d1" | "salesforce" = "salesforce";
 
 if (!bypassCache) {
-  userData = await d1Cache.getUser(userId);
-  if (userData) {
+  const userHit = await d1Cache.getUserWithETag(userId);
+  if (userHit && userHit.data) {
+    userData = userHit.data;
     isUserCached = true;
     userSource = "d1";
-    userEtag = (await d1Cache.getUserETag(userId)) || (await computeETag(userData));
+    userEtag = userHit.etag || (await computeETag(userData));
   }
 }
 
@@ -153,11 +155,12 @@ let isConvCached = false;
 let convSource: "d1" | "auth_service" | "salesforce" = "auth_service";
 
 if (!bypassCache) {
-  convData = await d1Cache.getConversationHistory(userId);
-  if (convData) {
+  const convHit = await d1Cache.getConversationHistoryWithETag(userId);
+  if (convHit && convHit.data) {
+    convData = convHit.data;
     isConvCached = true;
     convSource = "d1";
-    convEtag = (await d1Cache.getConversationETag(userId)) || (await computeETag(convData));
+    convEtag = convHit.etag || (await computeETag(convData));
   }
 }
 
@@ -620,11 +623,12 @@ export async function assembleContext(
     let userSource: "d1" | "salesforce" = "salesforce";
 
     if (!options.bypassCache && !options.bypassUserCache) {
-      customerData = await d1Cache.getUser(userId);
-      if (customerData) {
+      const customerHit = await d1Cache.getUserWithETag(userId);
+      if (customerHit && customerHit.data) {
+        customerData = customerHit.data;
         isUserCached = true;
         userSource = "d1";
-        userEtag = (await d1Cache.getUserETag(userId)) || (await computeETag(customerData));
+        userEtag = customerHit.etag || (await computeETag(customerData));
       }
     }
 
@@ -656,11 +660,12 @@ export async function assembleContext(
     let convSource: "d1" | "auth_service" | "salesforce" = "auth_service";
 
     if (!options.bypassCache && !options.bypassConversationCache) {
-      convData = await d1Cache.getConversationHistory(userId);
-      if (convData) {
+      const convHit = await d1Cache.getConversationHistoryWithETag(userId);
+      if (convHit && convHit.data) {
+        convData = convHit.data;
         isConvCached = true;
         convSource = "d1";
-        convEtag = (await d1Cache.getConversationETag(userId)) || (await computeETag(convData));
+        convEtag = convHit.etag || (await computeETag(convData));
       }
     }
 
@@ -730,11 +735,12 @@ export async function assembleContext(
     let globalSource: "d1" | "b2" | "salesforce" = "salesforce";
 
     if (!options.bypassCache && !options.bypassGlobalCache) {
-      globalData = await d1Cache.getGlobalData360(channelId);
-      if (globalData) {
+      const globalHit = await d1Cache.getGlobalData360WithETag(channelId);
+      if (globalHit && globalHit.data) {
+        globalData = globalHit.data;
         isGlobalCached = true;
         globalSource = "d1";
-        globalEtag = (await d1Cache.getGlobalETag(channelId)) || (await computeETag(globalData));
+        globalEtag = globalHit.etag || (await computeETag(globalData));
       }
     }
 
@@ -777,12 +783,12 @@ export async function assembleContext(
     let toolUrlsSource: "d1" | "auth_service" | "retrieve64" = "auth_service";
 
     if (!options.bypassCache && !options.bypassToolUrlsCache) {
-      const cachedUrls = await d1Cache.getToolUrls(channelId);
-      if (cachedUrls) {
-        toolCallUrls = cachedUrls;
+      const toolHit = await d1Cache.getToolUrlsWithETag(channelId);
+      if (toolHit && toolHit.data) {
+        toolCallUrls = toolHit.data;
         isToolUrlsCached = true;
         toolUrlsSource = "d1";
-        toolUrlsEtag = (await d1Cache.getToolUrlsETag(channelId)) || (await computeETag(toolCallUrls));
+        toolUrlsEtag = toolHit.etag || (await computeETag(toolCallUrls));
       }
     }
 
@@ -825,11 +831,13 @@ export async function assembleContext(
     let agentSource: "d1" | "parser" | "provided" = "parser";
 
     if (!options.bypassCache && !options.bypassAgentCache) {
-      precompiledAgent = await d1Cache.getAgentCode(agentKey);
-      if (precompiledAgent && Array.isArray(precompiledAgent.topics) && precompiledAgent.topics.length > 0) {
+      const agentHit = await d1Cache.getAgentCodeWithETag(agentKey);
+      const agentCandidate = agentHit ? agentHit.data : null;
+      if (agentCandidate && Array.isArray(agentCandidate.topics) && agentCandidate.topics.length > 0) {
+        precompiledAgent = agentCandidate;
         isAgentCached = true;
         agentSource = "d1";
-        agentEtag = (await d1Cache.getAgentCodeETag(agentKey)) || (await computeETag(precompiledAgent));
+        agentEtag = (agentHit ? agentHit.etag : null) || (await computeETag(precompiledAgent));
       } else {
         precompiledAgent = null;
       }

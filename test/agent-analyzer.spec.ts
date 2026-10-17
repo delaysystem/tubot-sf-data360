@@ -92,6 +92,35 @@ actions:
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("queries only real MessagingChannel columns (TargetType does not exist)", async () => {
+    const analyzer = new AgentAnalyzer();
+    const bodies: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string, init?: { body?: unknown }) => {
+      if (url.includes("/composite/batch")) {
+        bodies.push(String(init?.body ?? ""));
+        return Response.json({
+          hasErrors: false,
+          results: [
+            { statusCode: 200, result: { records: [{ Id: "0Mjg5000000VtMnCAK", DeveloperName: "Ch", MasterLabel: "Ch" }] } },
+            { statusCode: 200, result: { records: [] } },
+            { statusCode: 200, result: { records: [] } },
+            { statusCode: 200, result: { records: [] } },
+          ],
+        });
+      }
+      return Response.json({ records: [] });
+    });
+    try {
+      await analyzer.resolveChannelAndAgent(conn, "0Mjg5000000VtMnCAK");
+      const decoded = bodies.map((b) => decodeURIComponent(b)).join("\n");
+      expect(decoded).toContain("TargetQueueId");
+      expect(decoded).not.toContain("TargetType");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 describe("AgentAnalyzer channel-map caching", () => {
