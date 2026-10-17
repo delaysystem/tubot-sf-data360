@@ -360,6 +360,17 @@ export class D1Data360Cache {
           )
         `)
         .run();
+      // F15: the retention purge predicates (expires_at ranges) must SEEK.
+      for (const [table, index] of [
+        ["data360_user_cache", "data360_user_cache_expires_idx"],
+        ["data360_session_cache", "data360_session_cache_expires_idx"],
+        ["data360_conversation_cache", "data360_conversation_cache_expires_idx"],
+        ["data360_global_cache", "data360_global_cache_expires_idx"],
+        ["data360_agent_code_cache", "data360_agent_code_cache_expires_idx"],
+        ["data360_tool_urls_cache", "data360_tool_urls_cache_expires_idx"],
+      ] as Array<[string, string]>) {
+        await this.db.prepare(`CREATE INDEX IF NOT EXISTS ${index} ON ${table} (expires_at)`).run();
+      }
       // F10: the per-RPC nonce DELETE needs its expires_at index on every DB
       // this cache touches (shared helper, also called by claimServiceNonce).
       await ensureNonceSchema(this.db);

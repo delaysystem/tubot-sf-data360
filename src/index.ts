@@ -28,6 +28,7 @@ import {
   normalizeCanonicalUrl,
   sanitizeHeaders,
 } from "./cache-helper";
+import { maybeRunRetention, purgeRetention } from "./retention";
 
 export * from "./types";
 export * from "./auth-client";
@@ -1062,6 +1063,8 @@ function parseHeadersForAuth(request: Request, options: ExportData360Options): E
 export default {
   async fetch(request: Request, env: Data360Env, ctx?: any): Promise<Response> {
     initCache(env.DATA360_KV);
+    // F15 piggyback: daily retention claim + waitUntil purge, never blocking.
+    void maybeRunRetention(env.DB, ctx);
     try {
       const url = new URL(request.url);
       const path = url.pathname;
@@ -2390,5 +2393,13 @@ export default {
         { status: 500 }
       );
     }
+  },
+  // F15 dormant-ready cron entry: the account is at the Workers Free cron
+  // limit, so the live trigger is the fetch piggyback above; if cron capacity
+  // ever frees up, re-adding triggers.crons activates this unchanged.
+  async scheduled(controller: ScheduledController, env: Data360Env): Promise<void> {
+    if (!env.DB) return;
+    const summary = await purgeRetention(env.DB);
+    console.log(JSON.stringify({ msg: "f15_retention_purge", cron: controller.cron, ...summary }));
   },
 } satisfies ExportedHandler<Data360Env>;
