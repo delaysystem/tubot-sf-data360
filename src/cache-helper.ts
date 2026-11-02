@@ -381,9 +381,25 @@ export class D1Data360Cache {
     }
   }
 
+  /** Memory key for an org-bound read. Unbound callers (trusted RPC/service
+   * paths) keep the legacy bare key; HTTP token callers always bind. */
+  private static memKey(id: string, expectedOrg?: string): string {
+    return expectedOrg ? `org:${expectedOrg}\n${id}` : id;
+  }
+
+  /** Drops the bare entry plus every org-bound entry for one id. */
+  private static purgeId(bucket: Map<string, unknown>, id: string): void {
+    bucket.delete(id);
+    for (const key of bucket.keys()) {
+      if (key.endsWith(`\n${id}`)) bucket.delete(key);
+    }
+  }
+
   /** Single-SELECT read-through returning data + stored etag together (F16:
    * warm paths previously paid a second SELECT per component for the etag).
-   * Expiry, mem-population, and parse semantics match the old getters exactly. */
+   * Expiry, mem-population, and parse semantics match the old getters exactly.
+   * When expectedOrg is set, both the isolate-memory lookup and the D1 SELECT
+   * bind to that org, so a cached row never serves another tenant. */
   private async readThrough<T>(
     bucket: Map<string, MemoryCacheEntry<any>>,
     key: string,
@@ -391,9 +407,10 @@ export class D1Data360Cache {
     deleter: (key: string) => Promise<unknown>,
     parse: (raw: string) => T,
     payloadCol = "data",
+    expectedOrg?: string,
   ): Promise<CacheRead<T> | null> {
     const now = Date.now();
-    const mem = bucket.get(key);
+    const mem = bucket.get(D1Data360Cache.memKey(key, expectedOrg));
     if (mem && (mem.expiresAt === 0 || mem.expiresAt > now)) {
       return { data: mem.data as T, etag: mem.etag || null };
     }
@@ -402,8 +419,8 @@ export class D1Data360Cache {
     await this.ensureSchema();
     try {
       const row = await this.db
-        .prepare(sql)
-        .bind(key)
+        .prepare(expectedOrg ? `${sql} AND org_id = ?` : sql)
+        .bind(...(expectedOrg ? [key, expectedOrg] : [key]))
         .first<Record<string, any>>();
 
       if (!row) return null;
@@ -412,58 +429,63 @@ export class D1Data360Cache {
         return null;
       }
       const parsed = parse(row[payloadCol]);
-      bucket.set(key, { data: parsed, etag: row.etag || "", expiresAt: row.expires_at });
+      bucket.set(D1Data360Cache.memKey(key, expectedOrg), { data: parsed, etag: row.etag || "", expiresAt: row.expires_at });
       return { data: parsed, etag: row.etag || null };
     } catch {
       return null;
     }
   }
 
-  async getUserWithETag(userId: string): Promise<CacheRead<any> | null> {
+  async getUserWithETag(userId: string, expectedOrg?: string): Promise<CacheRead<any> | null> {
     return this.readThrough(this.bucket.user, userId,
       "SELECT data, etag, expires_at FROM data360_user_cache WHERE user_id = ?",
       (key) => this.deleteUser(key),
-      (raw) => { try { return JSON.parse(raw); } catch { return raw; } });
+      (raw) => { try { return JSON.parse(raw); } catch { return raw; } },
+      "data", expectedOrg);
   }
 
-  async getSessionWithETag(sessionId: string): Promise<CacheRead<any> | null> {
+  async getSessionWithETag(sessionId: string, expectedOrg?: string): Promise<CacheRead<any> | null> {
     return this.readThrough(this.bucket.session, sessionId,
       "SELECT data, etag, expires_at FROM data360_session_cache WHERE session_id = ?",
       (key) => this.deleteSession(key),
-      (raw) => { try { return JSON.parse(raw); } catch { return raw; } });
+      (raw) => { try { return JSON.parse(raw); } catch { return raw; } },
+      "data", expectedOrg);
   }
 
-  async getConversationHistoryWithETag(userId: string): Promise<CacheRead<any> | null> {
+  async getConversationHistoryWithETag(userId: string, expectedOrg?: string): Promise<CacheRead<any> | null> {
     return this.readThrough(this.bucket.conv, userId,
       "SELECT data, etag, expires_at FROM data360_conversation_cache WHERE user_id = ?",
       (key) => this.deleteConversationHistory(key),
-      (raw) => { try { return JSON.parse(raw); } catch { return raw; } });
+      (raw) => { try { return JSON.parse(raw); } catch { return raw; } },
+      "data", expectedOrg);
   }
 
-  async getGlobalData360WithETag(targetId: string): Promise<CacheRead<any> | null> {
+  async getGlobalData360WithETag(targetId: string, expectedOrg?: string): Promise<CacheRead<any> | null> {
     return this.readThrough(this.bucket.global, targetId,
       "SELECT data, etag, expires_at FROM data360_global_cache WHERE target_id = ?",
       (key) => this.deleteGlobalData360(key),
-      (raw) => { try { return JSON.parse(raw); } catch { return raw; } });
+      (raw) => { try { return JSON.parse(raw); } catch { return raw; } },
+      "data", expectedOrg);
   }
 
-  async getAgentCodeWithETag(agentKey: string): Promise<CacheRead<any> | null> {
+  async getAgentCodeWithETag(agentKey: string, expectedOrg?: string): Promise<CacheRead<any> | null> {
     return this.readThrough(this.bucket.agent, agentKey,
       "SELECT data, etag, expires_at FROM data360_agent_code_cache WHERE agent_key = ?",
       (key) => this.deleteAgentCode(key),
-      (raw) => { try { return JSON.parse(raw); } catch { return raw; } });
+      (raw) => { try { return JSON.parse(raw); } catch { return raw; } },
+      "data", expectedOrg);
   }
 
-  async getToolUrlsWithETag(channelId: string): Promise<CacheRead<string[]> | null> {
+  async getToolUrlsWithETag(channelId: string, expectedOrg?: string): Promise<CacheRead<string[]> | null> {
     return this.readThrough<string[]>(this.bucket.toolUrls, channelId,
       "SELECT urls, etag, expires_at FROM data360_tool_urls_cache WHERE channel_id = ?",
       (key) => this.deleteToolUrls(key),
       (raw) => { try { const parsed = JSON.parse(raw); return Array.isArray(parsed) ? parsed : []; } catch { return []; } },
-      "urls");
+      "urls", expectedOrg);
   }
 
-  async getUserETag(userId: string): Promise<string | null> {
-    const mem = this.bucket.user.get(userId);
+  async getUserETag(userId: string, expectedOrg?: string): Promise<string | null> {
+    const mem = this.bucket.user.get(D1Data360Cache.memKey(userId, expectedOrg));
     const now = Date.now();
     if (mem && (mem.expiresAt === 0 || mem.expiresAt > now)) {
       return mem.etag;
@@ -473,8 +495,10 @@ export class D1Data360Cache {
     await this.ensureSchema();
     try {
       const row = await this.db
-        .prepare("SELECT etag, expires_at FROM data360_user_cache WHERE user_id = ?")
-        .bind(userId)
+        .prepare(expectedOrg
+          ? "SELECT etag, expires_at FROM data360_user_cache WHERE user_id = ? AND org_id = ?"
+          : "SELECT etag, expires_at FROM data360_user_cache WHERE user_id = ?")
+        .bind(...(expectedOrg ? [userId, expectedOrg] : [userId]))
         .first<{ etag: string | null; expires_at: number }>();
 
       if (!row || !row.etag) return null;
@@ -488,8 +512,8 @@ export class D1Data360Cache {
     }
   }
 
-  async getUser(userId: string): Promise<any | null> {
-    const hit = await this.getUserWithETag(userId);
+  async getUser(userId: string, expectedOrg?: string): Promise<any | null> {
+    const hit = await this.getUserWithETag(userId, expectedOrg);
     return hit ? hit.data : null;
   }
 
@@ -511,7 +535,9 @@ export class D1Data360Cache {
       parsed = data;
     }
 
+    D1Data360Cache.purgeId(this.bucket.user, userId);
     this.bucket.user.set(userId, { data: parsed, etag, expiresAt });
+    if (orgId) this.bucket.user.set(D1Data360Cache.memKey(userId, orgId), { data: parsed, etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -532,7 +558,7 @@ export class D1Data360Cache {
   }
 
   async deleteUser(userId: string): Promise<boolean> {
-    this.bucket.user.delete(userId);
+    D1Data360Cache.purgeId(this.bucket.user, userId);
     if (!this.db) return false;
     await this.ensureSchema();
     try {
@@ -546,8 +572,8 @@ export class D1Data360Cache {
     }
   }
 
-  async getSessionETag(sessionId: string): Promise<string | null> {
-    const mem = this.bucket.session.get(sessionId);
+  async getSessionETag(sessionId: string, expectedOrg?: string): Promise<string | null> {
+    const mem = this.bucket.session.get(D1Data360Cache.memKey(sessionId, expectedOrg));
     const now = Date.now();
     if (mem && (mem.expiresAt === 0 || mem.expiresAt > now)) {
       return mem.etag;
@@ -557,8 +583,10 @@ export class D1Data360Cache {
     await this.ensureSchema();
     try {
       const row = await this.db
-        .prepare("SELECT etag, expires_at FROM data360_session_cache WHERE session_id = ?")
-        .bind(sessionId)
+        .prepare(expectedOrg
+          ? "SELECT etag, expires_at FROM data360_session_cache WHERE session_id = ? AND org_id = ?"
+          : "SELECT etag, expires_at FROM data360_session_cache WHERE session_id = ?")
+        .bind(...(expectedOrg ? [sessionId, expectedOrg] : [sessionId]))
         .first<{ etag: string | null; expires_at: number }>();
 
       if (!row || !row.etag) return null;
@@ -572,8 +600,8 @@ export class D1Data360Cache {
     }
   }
 
-  async getSession(sessionId: string): Promise<any | null> {
-    const hit = await this.getSessionWithETag(sessionId);
+  async getSession(sessionId: string, expectedOrg?: string): Promise<any | null> {
+    const hit = await this.getSessionWithETag(sessionId, expectedOrg);
     return hit ? hit.data : null;
   }
 
@@ -595,7 +623,9 @@ export class D1Data360Cache {
       parsed = data;
     }
 
+    D1Data360Cache.purgeId(this.bucket.session, sessionId);
     this.bucket.session.set(sessionId, { data: parsed, etag, expiresAt });
+    if (orgId) this.bucket.session.set(D1Data360Cache.memKey(sessionId, orgId), { data: parsed, etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -616,7 +646,7 @@ export class D1Data360Cache {
   }
 
   async deleteSession(sessionId: string): Promise<boolean> {
-    this.bucket.session.delete(sessionId);
+    D1Data360Cache.purgeId(this.bucket.session, sessionId);
     if (!this.db) return false;
     await this.ensureSchema();
     try {
@@ -630,8 +660,8 @@ export class D1Data360Cache {
     }
   }
 
-  async getConversationETag(userId: string): Promise<string | null> {
-    const mem = this.bucket.conv.get(userId);
+  async getConversationETag(userId: string, expectedOrg?: string): Promise<string | null> {
+    const mem = this.bucket.conv.get(D1Data360Cache.memKey(userId, expectedOrg));
     const now = Date.now();
     if (mem && (mem.expiresAt === 0 || mem.expiresAt > now)) {
       return mem.etag || null;
@@ -641,8 +671,10 @@ export class D1Data360Cache {
     await this.ensureSchema();
     try {
       const row = await this.db
-        .prepare("SELECT etag, expires_at FROM data360_conversation_cache WHERE user_id = ?")
-        .bind(userId)
+        .prepare(expectedOrg
+          ? "SELECT etag, expires_at FROM data360_conversation_cache WHERE user_id = ? AND org_id = ?"
+          : "SELECT etag, expires_at FROM data360_conversation_cache WHERE user_id = ?")
+        .bind(...(expectedOrg ? [userId, expectedOrg] : [userId]))
         .first<{ etag: string | null; expires_at: number }>();
 
       if (!row || !row.etag) return null;
@@ -687,7 +719,9 @@ export class D1Data360Cache {
       parsed = data;
     }
 
+    D1Data360Cache.purgeId(this.bucket.conv, userId);
     this.bucket.conv.set(userId, { data: parsed, etag, expiresAt });
+    if (orgId) this.bucket.conv.set(D1Data360Cache.memKey(userId, orgId), { data: parsed, etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -710,7 +744,7 @@ export class D1Data360Cache {
   }
 
   async deleteConversationHistory(userId: string): Promise<boolean> {
-    this.bucket.conv.delete(userId);
+    D1Data360Cache.purgeId(this.bucket.conv, userId);
     if (!this.db) return false;
     await this.ensureSchema();
     try {
@@ -724,8 +758,8 @@ export class D1Data360Cache {
     }
   }
 
-  async getGlobalETag(targetId: string): Promise<string | null> {
-    const mem = this.bucket.global.get(targetId);
+  async getGlobalETag(targetId: string, expectedOrg?: string): Promise<string | null> {
+    const mem = this.bucket.global.get(D1Data360Cache.memKey(targetId, expectedOrg));
     const now = Date.now();
     if (mem && (mem.expiresAt === 0 || mem.expiresAt > now)) {
       return mem.etag || null;
@@ -735,8 +769,10 @@ export class D1Data360Cache {
     await this.ensureSchema();
     try {
       const row = await this.db
-        .prepare("SELECT etag, expires_at FROM data360_global_cache WHERE target_id = ?")
-        .bind(targetId)
+        .prepare(expectedOrg
+          ? "SELECT etag, expires_at FROM data360_global_cache WHERE target_id = ? AND org_id = ?"
+          : "SELECT etag, expires_at FROM data360_global_cache WHERE target_id = ?")
+        .bind(...(expectedOrg ? [targetId, expectedOrg] : [targetId]))
         .first<{ etag: string | null; expires_at: number }>();
 
       if (!row || !row.etag) return null;
@@ -773,7 +809,9 @@ export class D1Data360Cache {
       parsed = data;
     }
 
+    D1Data360Cache.purgeId(this.bucket.global, targetId);
     this.bucket.global.set(targetId, { data: parsed, etag, expiresAt });
+    if (orgId) this.bucket.global.set(D1Data360Cache.memKey(targetId, orgId), { data: parsed, etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -794,7 +832,7 @@ export class D1Data360Cache {
   }
 
   async deleteGlobalData360(targetId: string): Promise<boolean> {
-    this.bucket.global.delete(targetId);
+    D1Data360Cache.purgeId(this.bucket.global, targetId);
     if (!this.db) return false;
     await this.ensureSchema();
     try {
@@ -860,7 +898,9 @@ export class D1Data360Cache {
       parsed = data;
     }
 
+    D1Data360Cache.purgeId(this.bucket.agent, agentKey);
     this.bucket.agent.set(agentKey, { data: parsed, etag, expiresAt });
+    if (orgId) this.bucket.agent.set(D1Data360Cache.memKey(agentKey, orgId), { data: parsed, etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -881,7 +921,7 @@ export class D1Data360Cache {
   }
 
   async deleteAgentCode(agentKey: string): Promise<boolean> {
-    this.bucket.agent.delete(agentKey);
+    D1Data360Cache.purgeId(this.bucket.agent, agentKey);
     if (!this.db) return false;
     await this.ensureSchema();
     try {
@@ -941,7 +981,9 @@ export class D1Data360Cache {
     const urlsStr = JSON.stringify(urls || []);
     const etag = options?.etag || (await computeETag(urlsStr));
 
+    D1Data360Cache.purgeId(this.bucket.toolUrls, channelId);
     this.bucket.toolUrls.set(channelId, { data: urls || [], etag, expiresAt });
+    if (orgId) this.bucket.toolUrls.set(D1Data360Cache.memKey(channelId, orgId), { data: urls || [], etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -962,7 +1004,7 @@ export class D1Data360Cache {
   }
 
   async deleteToolUrls(channelId: string): Promise<boolean> {
-    this.bucket.toolUrls.delete(channelId);
+    D1Data360Cache.purgeId(this.bucket.toolUrls, channelId);
     if (!this.db) return false;
     await this.ensureSchema();
     try {

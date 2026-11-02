@@ -179,6 +179,18 @@ export interface ExportData360Options {
    * catalog metadata. Default false keeps slim metadata so exports stay small.
    */
   includeObjectSchemas?: boolean;
+  /**
+   * HTTP-layer authentication result (set by the fetch gate, never by RPC
+   * callers). When present, D1 cache reads bind to this org and lazy auth
+   * reuses the validated connection instead of re-resolving.
+   */
+  authedOrgId?: string;
+  resolvedAuth?: {
+    connection: SalesforceConnection;
+    channelId?: string;
+    orgId?: string;
+    teamId?: string;
+  };
 }
 
 export interface BatchSubrequest {

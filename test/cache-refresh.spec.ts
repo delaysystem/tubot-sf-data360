@@ -1,4 +1,5 @@
 import { connectApiCoverageResponse } from "./helpers/connect-api";
+import { signedRequest, createGateMockD1 } from "./helpers/http-gate";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import worker from "../src/index";
 import { B2CacheManager } from "../src/b2-cache-manager";
@@ -86,13 +87,17 @@ describe("POST /cache/refresh internal gate", () => {
     expect(await res.json()).toEqual({ error: "method_not_allowed" });
   });
 
-  it("leaves /export ungated (no secret required)", async () => {
-    const req = new Request("https://data360.internal/export", {
+  it("gates /export (401 without credentials, 400 when signed but invalid)", async () => {
+    const anon = new Request("https://data360.internal/export", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     });
-    const res = await worker.fetch(req, baseEnv());
+    expect((await worker.fetch(anon, baseEnv())).status).toBe(401);
+
+    const gatedEnv = { ...baseEnv(), DB: createGateMockD1() };
+    const req = await signedRequest(gatedEnv, "POST", "https://data360.internal/export", { body: {} });
+    const res = await worker.fetch(req, gatedEnv);
     expect(res.status).toBe(400);
     const data = (await res.json()) as any;
     expect(data.error).toBe("invalid_request");

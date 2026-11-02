@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { signedRequest } from "./helpers/http-gate";
 import worker, { TubotSfData360Entrypoint } from "../src/index";
 import type { Data360Env } from "../src/types";
 
@@ -75,13 +76,15 @@ describe("tubot-sf-data360 worker endpoints", () => {
     expect(data.service).toBe("tubot-sf-data360");
   });
 
-  it("requires channelId or agentName on /export", async () => {
+  it("returns 401 without credentials and 400 when channelId or agentName is missing on /export", async () => {
+    const anon = new Request("https://example.com/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect((await worker.fetch(anon, mockEnv)).status).toBe(401);
     const response = await worker.fetch(
-      new Request("https://example.com/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      }),
+      await signedRequest(mockEnv, "POST", "https://example.com/export", { body: {} }),
       mockEnv
     );
     expect(response.status).toBe(400);
@@ -89,13 +92,15 @@ describe("tubot-sf-data360 worker endpoints", () => {
     expect(data.error).toBe("invalid_request");
   });
 
-  it("returns 400 for malformed JSON body on /export", async () => {
+  it("returns 401 without credentials and 400 for malformed JSON body on /export", async () => {
+    const anon = new Request("https://example.com/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "invalid-json{",
+    });
+    expect((await worker.fetch(anon, mockEnv)).status).toBe(401);
     const response = await worker.fetch(
-      new Request("https://example.com/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "invalid-json{",
-      }),
+      await signedRequest(mockEnv, "POST", "https://example.com/export", { body: "invalid-json{" }),
       mockEnv
     );
     expect(response.status).toBe(400);

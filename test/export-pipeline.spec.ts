@@ -1,8 +1,16 @@
 import { connectApiCoverageResponse } from "./helpers/connect-api";
+import { signedRequest, createGateMockD1 } from "./helpers/http-gate";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { unzipSync, strFromU8 } from "fflate";
 import worker from "../src/index";
 import type { Data360Env } from "../src/types";
+
+const GATE_KEY = "test-internal-secret-0123456789abcdef";
+const withGate = (env: Data360Env): Data360Env => ({
+  ...env,
+  DATA360_INTERNAL_KEY: GATE_KEY,
+  DB: createGateMockD1(),
+});
 
 describe("tubot-sf-data360 export pipeline", () => {
   let originalFetch: typeof fetch;
@@ -146,18 +154,17 @@ describe("tubot-sf-data360 export pipeline", () => {
       },
     };
 
-    const req = new Request("https://data360.internal/export", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    const gatedEnv = withGate(env);
+    const req = await signedRequest(gatedEnv, "POST", "https://data360.internal/export", {
+      body: {
         channelId: "0Mjg5000000VtMnCAK",
         agentName: "DATA360TEST",
         teamId: "team-1",
         orgId: "00D000000000001AAA",
-      }),
+      },
     });
 
-    const res = await worker.fetch(req, env);
+    const res = await worker.fetch(req, gatedEnv);
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("application/zip");
     expect(res.headers.get("Content-Disposition")).toContain("data360-");
@@ -205,18 +212,17 @@ describe("tubot-sf-data360 export pipeline", () => {
       },
     };
 
-    const req = new Request("https://data360.internal/export", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    const gatedEnv = withGate(env);
+    const req = await signedRequest(gatedEnv, "POST", "https://data360.internal/export", {
+      body: {
         agentName: "DATA360TEST",
         format: "json",
         teamId: "team-1",
         orgId: "00D000000000001AAA",
-      }),
+      },
     });
 
-    const res = await worker.fetch(req, env);
+    const res = await worker.fetch(req, gatedEnv);
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("application/json");
 
@@ -249,14 +255,11 @@ describe("tubot-sf-data360 export pipeline", () => {
         }),
       },
     };
-    const postExport = (body: unknown) =>
+    const gatedEnv = withGate(env);
+    const postExport = async (body: unknown) =>
       worker.fetch(
-        new Request("https://data360.internal/export", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        }),
-        env
+        await signedRequest(gatedEnv, "POST", "https://data360.internal/export", { body }),
+        gatedEnv
       );
 
     const plain = await postExport({
@@ -279,14 +282,17 @@ describe("tubot-sf-data360 export pipeline", () => {
     expect(soapUrls.length).toBeGreaterThan(0);
   });
 
-  it("returns 400 when neither channelId nor agentName is provided", async () => {
-    const req = new Request("https://data360.internal/export", {
+  it("returns 401 without credentials and 400 when neither channelId nor agentName is provided", async () => {
+    const anon = new Request("https://data360.internal/export", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     });
+    expect((await worker.fetch(anon, {})).status).toBe(401);
 
-    const res = await worker.fetch(req, {});
+    const gatedEnv = withGate({});
+    const req = await signedRequest(gatedEnv, "POST", "https://data360.internal/export", { body: {} });
+    const res = await worker.fetch(req, gatedEnv);
     expect(res.status).toBe(400);
     const body = (await res.json()) as any;
     expect(body.error).toBe("invalid_request");
@@ -352,19 +358,18 @@ describe("tubot-sf-data360 export pipeline", () => {
       },
     };
 
-    const req = new Request("https://data360.internal/export", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    const gatedEnv = withGate(env);
+    const req = await signedRequest(gatedEnv, "POST", "https://data360.internal/export", {
+      body: {
         agentName: "DATA360TEST",
         format: "json",
         cacheToB2: true,
         teamId: "team-1",
         orgId: "00D000000000001AAA",
-      }),
+      },
     });
 
-    const res = await worker.fetch(req, env);
+    const res = await worker.fetch(req, gatedEnv);
     expect(res.status).toBe(200);
     expect(res.headers.get("X-Bz-Info-Bandwidth-Alliance")).toBe("true");
     expect(res.headers.get("X-B2-Snapshot-Id")).toBeDefined();

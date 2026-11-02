@@ -14,7 +14,7 @@ import type {
   DataCloudFamily,
 } from "./types";
 import { DATA_CLOUD_FAMILIES } from "./types";
-import { SalesforceAuthBridge, SalesforceAuthorizationError } from "./auth-client";
+import { SalesforceAuthBridge, SalesforceAuthorizationError, type ResolvedAuthResult } from "./auth-client";
 import { Data360Extractor } from "./data360-extractor";
 import { B2CacheManager } from "./b2-cache-manager";
 import { claimServiceNonce, readSigHeaders, verifyServiceSignature, verifyRpcEnvelope, type RpcEnvelopeInput, type ServiceSigHeaders } from "./service-verify";
@@ -60,7 +60,7 @@ const { userId, channelId, sessionId, bypassCache } = options;
 const d1Cache = new D1Data360Cache(env?.DB);
 const authBridge = new SalesforceAuthBridge(env);
 
-let authResult: any = null;
+let authResult: any = options.resolvedAuth ?? null;
 const getAuth = async () => {
   if (!authResult) {
     authResult = await authBridge.resolveToken({
@@ -79,7 +79,7 @@ let isGlobalCached = false;
 let globalSource: "d1" | "b2" | "salesforce" = "salesforce";
 
 if (!bypassCache) {
-  const globalHit = await d1Cache.getGlobalData360WithETag(targetGlobalId);
+  const globalHit = await d1Cache.getGlobalData360WithETag(targetGlobalId, options.authedOrgId);
   if (globalHit && globalHit.data) {
     globalData = globalHit.data;
     isGlobalCached = true;
@@ -90,12 +90,15 @@ if (!bypassCache) {
 
 if (!globalData) {
   const b2CacheManager = createB2CacheManager(env);
-  const b2Snapshot = options.orgId
-    ? await b2CacheManager.getLatestSnapshot(options.orgId, targetGlobalId).catch(() => null)
+  const snapshotOrg = options.authedOrgId || options.orgId;
+  const b2Snapshot = snapshotOrg
+    ? await b2CacheManager.getLatestSnapshot(snapshotOrg, targetGlobalId).catch(() => null)
     : null;
+  let resolved = false;
   if (b2Snapshot && !bypassCache) {
     globalData = b2Snapshot;
     globalSource = "b2";
+    resolved = true;
   } else {
     try {
       const auth = await getAuth();
@@ -105,14 +108,16 @@ if (!globalData) {
         channelId: targetGlobalId,
       });
       globalSource = "salesforce";
+      resolved = true;
     } catch {
       globalData = { channelId: targetGlobalId, status: "unavailable" };
     }
   }
   globalEtag = await computeETag(globalData);
   await d1Cache.putGlobalData360(targetGlobalId, globalData, {
-    orgId: options.orgId || authResult?.connection?.orgId,
+    orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
     etag: globalEtag,
+    ttlSeconds: resolved ? undefined : NEGATIVE_CACHE_TTL_SEC,
   });
 }
 
@@ -123,7 +128,7 @@ let isUserCached = false;
 let userSource: "d1" | "salesforce" = "salesforce";
 
 if (!bypassCache) {
-  const userHit = await d1Cache.getUserWithETag(userId);
+  const userHit = await d1Cache.getUserWithETag(userId, options.authedOrgId);
   if (userHit && userHit.data) {
     userData = userHit.data;
     isUserCached = true;
@@ -133,19 +138,22 @@ if (!bypassCache) {
 }
 
 if (!userData) {
+  let extracted = false;
   try {
     const auth = await getAuth();
     const b2CacheManager = createB2CacheManager(env);
     const extractor = new Data360Extractor(undefined, undefined, undefined, b2CacheManager);
     userData = await extractor.extractUserData360(auth.connection, userId, options);
     userSource = "salesforce";
+    extracted = true;
   } catch {
     userData = { userId, extractedAt: new Date().toISOString() };
   }
   userEtag = await computeETag(userData);
   await d1Cache.putUser(userId, userData, {
-    orgId: options.orgId || authResult?.connection?.orgId,
+    orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
     etag: userEtag,
+    ttlSeconds: extracted ? undefined : NEGATIVE_CACHE_TTL_SEC,
   });
 }
 
@@ -156,7 +164,7 @@ let isConvCached = false;
 let convSource: "d1" | "auth_service" | "salesforce" = "auth_service";
 
 if (!bypassCache) {
-  const convHit = await d1Cache.getConversationHistoryWithETag(userId);
+  const convHit = await d1Cache.getConversationHistoryWithETag(userId, options.authedOrgId);
   if (convHit && convHit.data) {
     convData = convHit.data;
     isConvCached = true;
@@ -166,15 +174,17 @@ if (!bypassCache) {
 }
 
 if (!convData) {
+  let fetched = false;
   try {
     convData = await authBridge.getUserConversationHistory(userId, {
       channelId,
       currentSessionId: sessionId,
       teamId: options.teamId,
-      orgId: options.orgId,
+      orgId: options.authedOrgId || options.orgId,
     });
     if (convData) {
       convSource = "auth_service";
+      fetched = true;
     }
   } catch {
     convData = null;
@@ -190,8 +200,9 @@ if (!convData) {
   }
   convEtag = await computeETag(convData);
   await d1Cache.putConversationHistory(userId, convData, {
-    orgId: options.orgId || authResult?.connection?.orgId,
+    orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
     etag: convEtag,
+    ttlSeconds: fetched ? undefined : NEGATIVE_CACHE_TTL_SEC,
   });
 }
 
@@ -240,6 +251,109 @@ async function requireData360RpcAuth(env: Data360Env, method: string, args: unkn
   const keys = [env.DATA360_INTERNAL_KEY, env.DATA360_INTERNAL_KEY_NEXT].filter((k): k is string => typeof k === "string");
   const ok = await verifyRpcEnvelope(keys, env.DB, method, args, auth);
   if (!ok) throw Object.assign(new Error("data360_rpc_unauthorized"), { status: 401 });
+}
+
+export interface Data360HttpAuth {
+  mode: "service" | "token";
+  orgId?: string;
+  auth?: ResolvedAuthResult;
+}
+
+/** Max POST body the HTTP gate buffers for HMAC verification (mirrors /cache/refresh). */
+const HTTP_GATE_MAX_BODY = 65536;
+
+/** TTL for failure fallbacks (degenerate rows). Successes cache at component
+ * defaults (300-600s); failures cache just long enough for ETag stability
+ * across rapid retries and upstream herd protection during outages, and never
+ * long enough to shadow real data. Security against cross-tenant poisoning
+ * comes from the HTTP gate plus org-bound reads, not from this TTL. */
+const NEGATIVE_CACHE_TTL_SEC = 30;
+
+/** HTTP caller auth for data routes: an HMAC service signature (worker mesh)
+ * or a live-validated explicit Salesforce token. Scope-only requests (team /
+ * org / channel ids with no credential) are rejected: ids are not secrets.
+ * Token mode pins the validated org so cache reads bind to it downstream. */
+async function requireData360HttpAuth(
+  request: Request,
+  env: Data360Env,
+  path: string,
+  opts?: { serviceOnly?: boolean },
+): Promise<Data360HttpAuth | Response> {
+  const keys = [env.DATA360_INTERNAL_KEY, env.DATA360_INTERNAL_KEY_NEXT].filter(
+    (k): k is string => typeof k === "string" && k.length >= 32,
+  );
+  const sig = readSigHeaders(request.headers);
+  if (sig) {
+    if (keys.length === 0 || !env.DB) {
+      return Response.json({ error: "data360_unconfigured" }, { status: 503 });
+    }
+    let rawBody = "";
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      try {
+        rawBody = await request.clone().text();
+      } catch {
+        return Response.json({ error: "invalid_request" }, { status: 400 });
+      }
+      if (rawBody.length > HTTP_GATE_MAX_BODY) {
+        return Response.json({ error: "invalid_request", message: "Body too large." }, { status: 413 });
+      }
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    const ok =
+      (await verifyServiceSignature(keys, request.method, path, rawBody, sig, nowSec)) &&
+      (await claimServiceNonce(env.DB, sig.nonce, nowSec));
+    if (!ok) return Response.json({ error: "unauthorized" }, { status: 401 });
+    return { mode: "service" };
+  }
+  if (opts?.serviceOnly) return Response.json({ error: "unauthorized" }, { status: 401 });
+  const authHeader = request.headers.get("authorization") || request.headers.get("Authorization");
+  let accessToken = authHeader?.replace(/^Bearer\s+/i, "").trim() || "";
+  let instanceUrl = request.headers.get("x-salesforce-instance-url")?.trim() || "";
+  let assertedOrg = request.headers.get("x-org-id")?.trim() || "";
+  if (request.method === "POST") {
+    let body: any = null;
+    try {
+      const raw = await request.clone().text();
+      if (raw.length > HTTP_GATE_MAX_BODY) {
+        return Response.json({ error: "invalid_request", message: "Body too large." }, { status: 413 });
+      }
+      body = raw ? JSON.parse(raw) : null;
+    } catch {
+      body = null;
+    }
+    if (body && typeof body === "object") {
+      if (!accessToken) {
+        const t = body.accessToken ?? body.access_token;
+        if (typeof t === "string") accessToken = t.replace(/^Bearer\s+/i, "").trim();
+      }
+      if (!instanceUrl && typeof (body.instanceUrl ?? body.instance_url) === "string") {
+        instanceUrl = (body.instanceUrl ?? body.instance_url).trim();
+      }
+      if (!assertedOrg && typeof (body.orgId ?? body.org_id) === "string") {
+        assertedOrg = (body.orgId ?? body.org_id).trim();
+      }
+    }
+  }
+  // Query-string tokens are never accepted (URLs land in logs); an asserted
+  // org in the query is still honored for the caller's own mismatch check.
+  const orgParam = new URL(request.url).searchParams.get("orgId")?.trim() || "";
+  if (!accessToken || !instanceUrl) return Response.json({ error: "unauthorized" }, { status: 401 });
+  try {
+    const auth = await new SalesforceAuthBridge(env).resolveToken({
+      accessToken,
+      instanceUrl,
+      orgId: assertedOrg || orgParam || undefined,
+    });
+    return { mode: "token", orgId: auth.connection.orgId, auth };
+  } catch (error) {
+    if (error instanceof SalesforceAuthorizationError) {
+      return Response.json(
+        { error: error.status === 403 ? "forbidden" : "unauthorized" },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
 }
 
 export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
@@ -592,7 +706,7 @@ export async function assembleContext(
   const authBridge = new SalesforceAuthBridge(env);
   const b2CacheManager = createB2CacheManager(env);
 
-  let authResult: any = null;
+  let authResult: any = options.resolvedAuth ?? null;
   const getAuth = async () => {
     if (!authResult) {
       authResult = await authBridge.resolveToken({
@@ -624,7 +738,7 @@ export async function assembleContext(
     let userSource: "d1" | "salesforce" = "salesforce";
 
     if (!options.bypassCache && !options.bypassUserCache) {
-      const customerHit = await d1Cache.getUserWithETag(userId);
+      const customerHit = await d1Cache.getUserWithETag(userId, options.authedOrgId);
       if (customerHit && customerHit.data) {
         customerData = customerHit.data;
         isUserCached = true;
@@ -634,19 +748,22 @@ export async function assembleContext(
     }
 
     if (!customerData) {
+      let extracted = false;
       try {
         const auth = await getAuth();
         const extractor = new Data360Extractor(undefined, undefined, undefined, b2CacheManager);
         customerData = await extractor.extractUserData360(auth.connection, userId, options);
         userSource = "salesforce";
+        extracted = true;
       } catch {
         customerData = { userId, extractedAt: new Date().toISOString() };
       }
       userEtag = await computeETag(customerData);
       await writeD1(
         d1Cache.putUser(userId, customerData, {
-          orgId: options.orgId || authResult?.connection?.orgId,
+          orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
           etag: userEtag,
+          ttlSeconds: extracted ? undefined : NEGATIVE_CACHE_TTL_SEC,
         })
       );
     }
@@ -661,7 +778,7 @@ export async function assembleContext(
     let convSource: "d1" | "auth_service" | "salesforce" = "auth_service";
 
     if (!options.bypassCache && !options.bypassConversationCache) {
-      const convHit = await d1Cache.getConversationHistoryWithETag(userId);
+      const convHit = await d1Cache.getConversationHistoryWithETag(userId, options.authedOrgId);
       if (convHit && convHit.data) {
         convData = convHit.data;
         isConvCached = true;
@@ -671,16 +788,18 @@ export async function assembleContext(
     }
 
     if (!convData) {
+      let fetched = false;
       try {
         convData = await authBridge.getUserConversationHistory(userId, {
           channelId,
           currentSessionId: options.sessionId,
           limit: options.conversationLimit,
           teamId: options.teamId,
-          orgId: options.orgId,
+          orgId: options.authedOrgId || options.orgId,
         });
         if (convData) {
           convSource = "auth_service";
+          fetched = true;
         }
       } catch {
         convData = null;
@@ -697,8 +816,9 @@ export async function assembleContext(
       convEtag = await computeETag(convData);
       await writeD1(
         d1Cache.putConversationHistory(userId, convData, {
-          orgId: options.orgId || authResult?.connection?.orgId,
+          orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
           etag: convEtag,
+          ttlSeconds: fetched ? undefined : NEGATIVE_CACHE_TTL_SEC,
         })
       );
     }
@@ -736,7 +856,7 @@ export async function assembleContext(
     let globalSource: "d1" | "b2" | "salesforce" = "salesforce";
 
     if (!options.bypassCache && !options.bypassGlobalCache) {
-      const globalHit = await d1Cache.getGlobalData360WithETag(channelId);
+      const globalHit = await d1Cache.getGlobalData360WithETag(channelId, options.authedOrgId);
       if (globalHit && globalHit.data) {
         globalData = globalHit.data;
         isGlobalCached = true;
@@ -746,12 +866,15 @@ export async function assembleContext(
     }
 
     if (!globalData) {
-      const b2Snapshot = options.orgId
-        ? await b2CacheManager.getLatestSnapshot(options.orgId, channelId).catch(() => null)
+      const snapshotOrg = options.authedOrgId || options.orgId;
+      const b2Snapshot = snapshotOrg
+        ? await b2CacheManager.getLatestSnapshot(snapshotOrg, channelId).catch(() => null)
         : null;
+      let resolved = false;
       if (b2Snapshot && !options.bypassCache) {
         globalData = b2Snapshot;
         globalSource = "b2";
+        resolved = true;
       } else {
         try {
           const auth = await getAuth();
@@ -761,6 +884,7 @@ export async function assembleContext(
             channelId,
           });
           globalSource = "salesforce";
+          resolved = true;
         } catch {
           globalData = { channelId, status: "unavailable" };
         }
@@ -768,8 +892,9 @@ export async function assembleContext(
       globalEtag = await computeETag(globalData);
       await writeD1(
         d1Cache.putGlobalData360(channelId, globalData, {
-          orgId: options.orgId || authResult?.connection?.orgId,
+          orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
           etag: globalEtag,
+          ttlSeconds: resolved ? undefined : NEGATIVE_CACHE_TTL_SEC,
         })
       );
     }
@@ -784,7 +909,7 @@ export async function assembleContext(
     let toolUrlsSource: "d1" | "auth_service" | "retrieve64" = "auth_service";
 
     if (!options.bypassCache && !options.bypassToolUrlsCache) {
-      const toolHit = await d1Cache.getToolUrlsWithETag(channelId);
+      const toolHit = await d1Cache.getToolUrlsWithETag(channelId, options.authedOrgId);
       if (toolHit && toolHit.data) {
         toolCallUrls = toolHit.data;
         isToolUrlsCached = true;
@@ -795,11 +920,13 @@ export async function assembleContext(
 
     if (!isToolUrlsCached) {
       const gData = getGlobalData();
+      let lookedUp = false;
       try {
         toolCallUrls = await authBridge.getCallableToolUrls(channelId, {
-          orgId: options.orgId,
+          orgId: options.authedOrgId || options.orgId,
           teamId: options.teamId,
         });
+        lookedUp = true;
         if (toolCallUrls.length > 0) {
           toolUrlsSource = "retrieve64";
         }
@@ -816,8 +943,9 @@ export async function assembleContext(
       toolUrlsEtag = await computeETag(toolCallUrls);
       await writeD1(
         d1Cache.putToolUrls(channelId, toolCallUrls, {
-          orgId: options.orgId || authResult?.connection?.orgId,
+          orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
           etag: toolUrlsEtag,
+          ttlSeconds: lookedUp ? undefined : NEGATIVE_CACHE_TTL_SEC,
         })
       );
     }
@@ -832,7 +960,7 @@ export async function assembleContext(
     let agentSource: "d1" | "parser" | "provided" = "parser";
 
     if (!options.bypassCache && !options.bypassAgentCache) {
-      const agentHit = await d1Cache.getAgentCodeWithETag(agentKey);
+      const agentHit = await d1Cache.getAgentCodeWithETag(agentKey, options.authedOrgId);
       const agentCandidate = agentHit ? agentHit.data : null;
       if (agentCandidate && Array.isArray(agentCandidate.topics) && agentCandidate.topics.length > 0) {
         precompiledAgent = agentCandidate;
@@ -922,10 +1050,14 @@ export async function assembleContext(
       }
 
       agentEtag = await computeETag(precompiledAgent);
+      // The hardcoded fallback template caches briefly only: it must neither
+      // shadow real agent code nor delay parser recovery by a full TTL.
+      const callerProvided = !!(options.agentScript || options.agentXml);
       await writeD1(
         d1Cache.putAgentCode(agentKey, precompiledAgent, {
-          orgId: options.orgId || authResult?.connection?.orgId,
+          orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
           etag: agentEtag,
+          ttlSeconds: agentSource === "parser" || callerProvided ? undefined : NEGATIVE_CACHE_TTL_SEC,
         })
       );
     }
@@ -1100,6 +1232,44 @@ export default {
       });
     }
 
+    // Hoisted route matches: the HTTP gate below and the handlers reuse them.
+    const userMatch =
+      path.match(/^\/(?:api\/)?data360\/users?(?:\/([^\/]+))?$/) ||
+      path.match(/^\/(?:api\/)?users\/([^\/]+)\/data360$/);
+    const sessionMatch =
+      path.match(/^\/(?:api\/)?data360\/messagingsessions?(?:\/([^\/]+))?$/) ||
+      path.match(/^\/(?:api\/)?messagingsessions\/([^\/]+)\/data360$/);
+
+    // HTTP auth gate: every data route requires a caller identity — an HMAC
+    // service signature or a live-validated Salesforce token. The /cache/*
+    // routes above and /api/cache/agent(s) + /cache/refresh below keep their
+    // own equivalent gates; purge is service-only (infra, not tenant data).
+    let httpAuth: Data360HttpAuth | null = null;
+    {
+      const isPurge = path === "/api/data360/cache/purge" || path === "/data360/cache/purge";
+      const isGatedDataRoute =
+        isPurge ||
+        path === "/api/v1/context" ||
+        path === "/api/data360/context" ||
+        path === "/data360/context" ||
+        path === "/context" ||
+        path === "/api/data360/corresponding-data" ||
+        path === "/data360/corresponding-data" ||
+        path === "/export" ||
+        path === "/api/export" ||
+        userMatch !== null ||
+        sessionMatch !== null;
+      if (isGatedDataRoute) {
+        const gated = await requireData360HttpAuth(request, env, path, isPurge ? { serviceOnly: true } : undefined);
+        if (gated instanceof Response) return gated;
+        httpAuth = gated;
+      }
+    }
+    // Token callers: live-validated org binds every cache read/write below.
+    // Service callers assert trusted scope and keep legacy unbound behavior.
+    const httpOrg = httpAuth?.mode === "token" ? httpAuth.orgId : undefined;
+    const httpResolvedAuth = httpAuth?.mode === "token" ? httpAuth.auth : undefined;
+
     // ==========================================
     // Declarative Cache Purge Endpoint
     // POST /api/data360/cache/purge, POST /data360/cache/purge
@@ -1212,6 +1382,9 @@ export default {
       const cacheUrl = new URL(request.url);
       cacheUrl.searchParams.set("userId", userId);
       cacheUrl.searchParams.set("channelId", channelId);
+      // Edge entries are keyed per validated org: without this, two authed
+      // callers for the same user/channels share one cached response.
+      cacheUrl.searchParams.set("httpOrg", httpOrg ?? "service");
       if (body.sessionId || url.searchParams.get("sessionId")) {
         cacheUrl.searchParams.set("sessionId", (body.sessionId || url.searchParams.get("sessionId"))!);
       }
@@ -1246,7 +1419,8 @@ export default {
         channelId,
         agentName: body.agentName || url.searchParams.get("agentName") || channelId,
         sessionId: body.sessionId || url.searchParams.get("sessionId") || undefined,
-        orgId: orgId || undefined,
+        // Token mode pins the validated org: caller assertions are ignored.
+        orgId: httpOrg || orgId || undefined,
         teamId: body.teamId || url.searchParams.get("teamId") || undefined,
         accessToken: accessToken || undefined,
         instanceUrl: instanceUrl || undefined,
@@ -1259,6 +1433,8 @@ export default {
         bypassConversationCache: body.bypassConversationCache,
         bypassGlobalCache: body.bypassGlobalCache,
         conversationLimit: body.conversationLimit ? Number(body.conversationLimit) : undefined,
+        authedOrgId: httpOrg,
+        resolvedAuth: httpResolvedAuth,
       };
 
       let result;
@@ -1382,9 +1558,9 @@ export default {
       // Fast-path ETag check:
       // If client sent If-None-Match, check stored component ETags in D1
       if (request.headers.get("if-none-match") && !bypassCache) {
-        const storedGlobalETag = await d1Cache.getGlobalETag(channelId);
-        const storedUserETag = await d1Cache.getUserETag(userId);
-        const storedConvETag = await d1Cache.getConversationETag(userId);
+        const storedGlobalETag = await d1Cache.getGlobalETag(channelId, httpOrg);
+        const storedUserETag = await d1Cache.getUserETag(userId, httpOrg);
+        const storedConvETag = await d1Cache.getConversationETag(userId, httpOrg);
 
         if (storedGlobalETag && storedUserETag && storedConvETag) {
           const expectedCompositeETag = await computeETag(
@@ -1412,9 +1588,13 @@ export default {
         channelId,
         sessionId,
         bypassCache,
-        orgId: url.searchParams.get("orgId") || body.orgId,
+        orgId: httpOrg || url.searchParams.get("orgId") || body.orgId,
+        authedOrgId: httpOrg,
+        resolvedAuth: httpResolvedAuth,
       };
       parseHeadersForAuth(request, options);
+      // Token mode pins the validated org: caller assertions below it are ignored.
+      if (httpOrg) options.orgId = httpOrg;
 
       let result: CorrespondingDataResult;
       try {
@@ -1468,9 +1648,7 @@ export default {
     // User Data360 Endpoints
     // GET/POST /api/data360/users/:userId, GET/POST /users/:userId/data360
     // ==========================================
-    const userMatch =
-      path.match(/^\/(?:api\/)?data360\/users?(?:\/([^\/]+))?$/) ||
-      path.match(/^\/(?:api\/)?users\/([^\/]+)\/data360$/);
+    // (userMatch hoisted to the HTTP gate above; reuse it here.)
     if (userMatch) {
       const pathUserId = userMatch[1] ? decodeURIComponent(userMatch[1]) : undefined;
       const targetUserId = pathUserId || url.searchParams.get("userId") || url.searchParams.get("id");
@@ -1484,14 +1662,17 @@ export default {
         }
 
         const canonicalUrl = normalizeCanonicalUrl(request.url);
-        const canonicalReq = new Request(canonicalUrl, { headers: request.headers });
+        const edgeKeyUrl = new URL(canonicalUrl);
+        // Edge entries are keyed per validated org (see /context salt).
+        edgeKeyUrl.searchParams.set("httpOrg", httpOrg ?? "service");
+        const canonicalReq = new Request(edgeKeyUrl.toString(), { headers: request.headers });
 
         const d1Cache = new D1Data360Cache(env.DB);
 
         // Fast-path ETag check:
         // Before fetching full data or calling Salesforce, check if request has If-None-Match
         if (request.headers.get("if-none-match")) {
-          const storedEtag = await d1Cache.getUserETag(targetUserId);
+          const storedEtag = await d1Cache.getUserETag(targetUserId, httpOrg);
           if (storedEtag && isNotModified(request, storedEtag)) {
             return new Response(null, {
               status: 304,
@@ -1521,7 +1702,7 @@ export default {
         }
 
         // 2. D1 cache check
-        let userData = await d1Cache.getUser(targetUserId);
+        let userData = await d1Cache.getUser(targetUserId, httpOrg);
         let cacheSource = "d1";
 
         // 3. Salesforce extraction (if cache miss)
@@ -1539,9 +1720,12 @@ export default {
             if (apiVersionParam) options.apiVersion = apiVersionParam;
 
             parseHeadersForAuth(request, options);
+            // Token mode pins the validated org and reuses its connection:
+            // no second userinfo call, no scope-only channel mint.
+            if (httpOrg) options.orgId = httpOrg;
 
             const authBridge = new SalesforceAuthBridge(env);
-            const authResult = await authBridge.resolveToken(options);
+            const authResult = httpResolvedAuth || (await authBridge.resolveToken(options));
             const b2CacheManager = createB2CacheManager(env);
             const extractor = new Data360Extractor(undefined, undefined, undefined, b2CacheManager);
             userData = await extractor.extractUserData360(authResult.connection, targetUserId, options);
@@ -1550,7 +1734,7 @@ export default {
             // 4. Store in D1 cache
             const computedEtag = await computeETag(userData);
             await d1Cache.putUser(targetUserId, userData, {
-              orgId: options.orgId || authResult.connection.orgId,
+              orgId: httpOrg || options.orgId || authResult.connection.orgId,
               etag: computedEtag,
             });
           } catch (err: unknown) {
@@ -1619,7 +1803,10 @@ export default {
         }
 
         const payloadData = body.data !== undefined ? body.data : body;
+        // Token mode pins the validated org: callers cannot write into
+        // another org's D1 row or B2 prefix.
         const orgId =
+          httpOrg ||
           url.searchParams.get("orgId") ||
           request.headers.get("x-org-id") ||
           body?.orgId ||
@@ -1671,9 +1858,7 @@ export default {
     // MessagingSession Data360 Endpoints
     // GET/POST /api/data360/messagingsessions/:sessionId, GET/POST /messagingsessions/:sessionId/data360
     // ==========================================
-    const sessionMatch =
-      path.match(/^\/(?:api\/)?data360\/messagingsessions?(?:\/([^\/]+))?$/) ||
-      path.match(/^\/(?:api\/)?messagingsessions\/([^\/]+)\/data360$/);
+    // (sessionMatch hoisted to the HTTP gate above; reuse it here.)
     if (sessionMatch) {
       const pathSessionId = sessionMatch[1] ? decodeURIComponent(sessionMatch[1]) : undefined;
       const targetSessionId = pathSessionId || url.searchParams.get("sessionId") || url.searchParams.get("id");
@@ -1687,14 +1872,17 @@ export default {
         }
 
         const canonicalUrl = normalizeCanonicalUrl(request.url);
-        const canonicalReq = new Request(canonicalUrl, { headers: request.headers });
+        const edgeKeyUrl = new URL(canonicalUrl);
+        // Edge entries are keyed per validated org (see /context salt).
+        edgeKeyUrl.searchParams.set("httpOrg", httpOrg ?? "service");
+        const canonicalReq = new Request(edgeKeyUrl.toString(), { headers: request.headers });
 
         const d1Cache = new D1Data360Cache(env.DB);
 
         // Fast-path ETag check:
         // Before fetching full data or calling Salesforce, check if request has If-None-Match
         if (request.headers.get("if-none-match")) {
-          const storedEtag = await d1Cache.getSessionETag(targetSessionId);
+          const storedEtag = await d1Cache.getSessionETag(targetSessionId, httpOrg);
           if (storedEtag && isNotModified(request, storedEtag)) {
             return new Response(null, {
               status: 304,
@@ -1724,7 +1912,7 @@ export default {
         }
 
         // 2. D1 cache check
-        let sessionData = await d1Cache.getSession(targetSessionId);
+        let sessionData = await d1Cache.getSession(targetSessionId, httpOrg);
         let cacheSource = "d1";
 
         // 3. Salesforce extraction (if cache miss)
@@ -1742,9 +1930,12 @@ export default {
             if (apiVersionParam) options.apiVersion = apiVersionParam;
 
             parseHeadersForAuth(request, options);
+            // Token mode pins the validated org and reuses its connection:
+            // no second userinfo call, no scope-only channel mint.
+            if (httpOrg) options.orgId = httpOrg;
 
             const authBridge = new SalesforceAuthBridge(env);
-            const authResult = await authBridge.resolveToken(options);
+            const authResult = httpResolvedAuth || (await authBridge.resolveToken(options));
             const b2CacheManager = createB2CacheManager(env);
             const extractor = new Data360Extractor(undefined, undefined, undefined, b2CacheManager);
             sessionData = await extractor.extractMessagingSessionData360(authResult.connection, targetSessionId, options);
@@ -1753,7 +1944,7 @@ export default {
             // 4. Store in D1 cache
             const computedEtag = await computeETag(sessionData);
             await d1Cache.putSession(targetSessionId, sessionData, {
-              orgId: options.orgId || authResult.connection.orgId,
+              orgId: httpOrg || options.orgId || authResult.connection.orgId,
               etag: computedEtag,
             });
           } catch (err: unknown) {
@@ -1822,7 +2013,10 @@ export default {
         }
 
         const payloadData = body.data !== undefined ? body.data : body;
+        // Token mode pins the validated org: callers cannot write into
+        // another org's D1 row or B2 prefix.
         const orgId =
+          httpOrg ||
           url.searchParams.get("orgId") ||
           request.headers.get("x-org-id") ||
           body?.orgId ||
@@ -2082,9 +2276,13 @@ export default {
           }
         }
 
-        // 1. Resolve Salesforce credentials / token via tubot-sf-auth bridge
+        // 1. Resolve Salesforce credentials / token via tubot-sf-auth bridge.
+        // Token-gated /export calls reuse the gate's validated connection:
+        // no second userinfo call, no scope-only channel mint. Refresh calls
+        // (own HMAC gate above, httpAuth unset) resolve as before.
+        if (httpOrg) options.orgId = httpOrg;
         const authBridge = new SalesforceAuthBridge(env);
-        const authResult = await authBridge.resolveToken(options);
+        const authResult = httpResolvedAuth || (await authBridge.resolveToken(options));
 
         // 2. Extract Data 360 data via batched requests (and cache to B2 if requested)
         const cacheMgr = createB2CacheManager(env);
@@ -2388,7 +2586,6 @@ export default {
         {
           error: "internal_error",
           message: err instanceof Error ? err.message : String(err),
-          stack: err instanceof Error ? err.stack : undefined,
         },
         { status: 500 }
       );

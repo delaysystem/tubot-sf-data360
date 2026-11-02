@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { signedRequest } from "./helpers/http-gate";
 import worker, {
   TubotSfData360Entrypoint,
   D1Data360Cache,
@@ -211,16 +212,15 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
 
   describe("Phase 1: Multi-Turn Conversation Simulation", () => {
     it("Turn 1 (Initial contact): fetches all 3 components on cache MISS and saves them to D1", async () => {
-      const req = new Request(
+      const req = await signedRequest(env, "GET",
         `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}&channelId=${channelId}&sessionId=${session1Id}&orgId=${orgId}`,
         {
-          method: "GET",
           headers: {
             "x-salesforce-access-token": "test-token",
             "x-salesforce-instance-url": "https://test.my.salesforce.com",
             "x-team-id": "team-123",
           },
-        }
+        },
       );
 
       const res = await worker.fetch(req, env);
@@ -262,14 +262,13 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
 
       const expectedComposite = await computeETag(`${globalEtag}:${userEtag}:${convEtag}`);
 
-      const req = new Request(
+      const req = await signedRequest(env, "GET",
         `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}&channelId=${channelId}&sessionId=${session1Id}`,
         {
-          method: "GET",
           headers: {
             "If-None-Match": expectedComposite,
           },
-        }
+        },
       );
 
       const res = await worker.fetch(req, env);
@@ -296,16 +295,15 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
       });
 
       // Conversation cache was not yet populated or was invalidated for new message
-      const req = new Request(
+      const req = await signedRequest(env, "GET",
         `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}&channelId=${channelId}&sessionId=${session1Id}&orgId=${orgId}`,
         {
-          method: "GET",
           headers: {
             "x-salesforce-access-token": "test-token",
             "x-salesforce-instance-url": "https://test.my.salesforce.com",
             "x-team-id": "team-123",
           },
-        }
+        },
       );
 
       const res = await worker.fetch(req, env);
@@ -351,19 +349,18 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
       await d1Cache.putGlobalData360(channelId, { channelId, name: "Support Channel" });
       await d1Cache.putUser(userId, { userId, name: "Alice" });
 
-      const req = new Request(
+      const req = await signedRequest(env, "POST",
         `https://tubot-sf-data360.internal/api/data360/corresponding-data`,
         {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-team-id": "team-123" },
-          body: JSON.stringify({
+          headers: { "x-team-id": "team-123" },
+          body: {
             userId,
             channelId,
             sessionId: session2Id,
             teamId: "team-123",
             orgId,
-          }),
-        }
+          },
+        },
       );
 
       const res = await worker.fetch(req, env);
@@ -391,15 +388,14 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
       // Notice: user cache is intentionally NOT in D1 (popped / evicted)
       expect(mockD1.tables.get("data360_user_cache")?.has(userId)).toBe(false);
 
-      const req = new Request(
+      const req = await signedRequest(env, "GET",
         `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}&channelId=${channelId}`,
         {
-          method: "GET",
           headers: {
             "x-salesforce-access-token": "test-token",
             "x-salesforce-instance-url": "https://test.my.salesforce.com",
           },
-        }
+        },
       );
 
       const res = await worker.fetch(req, env);
@@ -427,15 +423,14 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
       // Notice: global cache is intentionally NOT in D1 (popped / evicted)
       expect(mockD1.tables.get("data360_global_cache")?.has(channelId)).toBe(false);
 
-      const req = new Request(
+      const req = await signedRequest(env, "GET",
         `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}&channelId=${channelId}`,
         {
-          method: "GET",
           headers: {
             "x-salesforce-access-token": "test-token",
             "x-salesforce-instance-url": "https://test.my.salesforce.com",
           },
-        }
+        },
       );
 
       const res = await worker.fetch(req, env);
@@ -456,15 +451,14 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
       await d1Cache.putUser(userId, { userId, name: "Old Alice" });
       await d1Cache.putConversationHistory(userId, conversationState);
 
-      const req = new Request(
+      const req = await signedRequest(env, "GET",
         `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}&channelId=${channelId}&bypassCache=true`,
         {
-          method: "GET",
           headers: {
             "x-salesforce-access-token": "test-token",
             "x-salesforce-instance-url": "https://test.my.salesforce.com",
           },
-        }
+        },
       );
 
       const res = await worker.fetch(req, env);
@@ -526,21 +520,14 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
   });
 
   describe("Phase 4: Input Validation & Edge Cases", () => {
-    it("returns 400 when userId is missing", async () => {
-      const req = new Request(
+    it("returns 401 without credentials and 400 when userId is missing", async () => {
+      const anon = new Request(
         `https://tubot-sf-data360.internal/api/data360/corresponding-data?channelId=${channelId}`,
         { method: "GET" }
       );
-      const res = await worker.fetch(req, env);
-      expect(res.status).toBe(400);
-      const data = await res.json();
-      expect(data.error).toBe("invalid_request");
-    });
-
-    it("returns 400 when channelId is missing", async () => {
-      const req = new Request(
-        `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}`,
-        { method: "GET" }
+      expect((await worker.fetch(anon, env)).status).toBe(401);
+      const req = await signedRequest(env, "GET",
+        `https://tubot-sf-data360.internal/api/data360/corresponding-data?channelId=${channelId}`,
       );
       const res = await worker.fetch(req, env);
       expect(res.status).toBe(400);
@@ -548,14 +535,34 @@ describe("Corresponding Data: Real Conversation Simulation & Pop Testing", () =>
       expect(data.error).toBe("invalid_request");
     });
 
-    it("returns 400 for malformed POST body", async () => {
-      const req = new Request(
+    it("returns 401 without credentials and 400 when channelId is missing", async () => {
+      const anon = new Request(
+        `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}`,
+        { method: "GET" }
+      );
+      expect((await worker.fetch(anon, env)).status).toBe(401);
+      const req = await signedRequest(env, "GET",
+        `https://tubot-sf-data360.internal/api/data360/corresponding-data?userId=${userId}`,
+      );
+      const res = await worker.fetch(req, env);
+      expect(res.status).toBe(400);
+      const data = await res.json();
+      expect(data.error).toBe("invalid_request");
+    });
+
+    it("returns 401 without credentials and 400 for malformed POST body", async () => {
+      const anon = new Request(
         `https://tubot-sf-data360.internal/api/data360/corresponding-data`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: "{ invalid_json ",
         }
+      );
+      expect((await worker.fetch(anon, env)).status).toBe(401);
+      const req = await signedRequest(env, "POST",
+        `https://tubot-sf-data360.internal/api/data360/corresponding-data`,
+        { body: "{ invalid_json " },
       );
       const res = await worker.fetch(req, env);
       expect(res.status).toBe(400);

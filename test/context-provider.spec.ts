@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { signedRequest } from "./helpers/http-gate";
 import worker, {
   TubotSfData360Entrypoint,
   D1Data360Cache,
@@ -279,13 +280,11 @@ describe("tubot-sf-data360 Context Provider & Smart Caching", () => {
   });
 
   it("serves REST API POST /api/v1/context with cache headers and composite ETag", async () => {
-    const req = new Request("https://tubot-sf-data360.internal/api/v1/context", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    const req = await signedRequest(mockEnv, "POST", "https://tubot-sf-data360.internal/api/v1/context", {
+      body: {
         userId: "user-456",
         channelId: "channel-rest",
-      }),
+      },
     });
 
     const res = await worker.fetch(req, mockEnv);
@@ -299,11 +298,16 @@ describe("tubot-sf-data360 Context Provider & Smart Caching", () => {
     expect(res.headers.get("Cache-Tag")).toContain("data360-tools-channel-rest");
   });
 
-  it("validates required parameters and returns 400 when missing userId or channelId", async () => {
-    const req = new Request("https://tubot-sf-data360.internal/api/v1/context", {
+  it("returns 401 without credentials and 400 when missing userId or channelId", async () => {
+    const anon = new Request("https://tubot-sf-data360.internal/api/v1/context", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ userId: "user-only" }),
+    });
+    expect((await worker.fetch(anon, mockEnv)).status).toBe(401);
+
+    const req = await signedRequest(mockEnv, "POST", "https://tubot-sf-data360.internal/api/v1/context", {
+      body: { userId: "user-only" },
     });
 
     const res = await worker.fetch(req, mockEnv);

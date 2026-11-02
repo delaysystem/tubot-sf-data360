@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { signedRequest } from "./helpers/http-gate";
 import worker, {
   TubotSfData360Entrypoint,
   D1Data360Cache,
@@ -389,7 +390,7 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
       const d1Cache = new D1Data360Cache(mockEnv.DB);
       await d1Cache.putUser("003USER01", { Id: "003USER01", name: "Cached User" });
 
-      const request = new Request("https://example.com/api/data360/users/003USER01?sig=stripme&t=12345");
+      const request = await signedRequest(mockEnv, "GET", "https://example.com/api/data360/users/003USER01?sig=stripme&t=12345");
       const response = await worker.fetch(request, mockEnv);
 
       expect(response.status).toBe(200);
@@ -408,7 +409,7 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
       await d1Cache.putUser("003USER02", userData);
       const expectedEtag = await computeETag(userData);
 
-      const request = new Request("https://example.com/data360/user?userId=003USER02", {
+      const request = await signedRequest(mockEnv, "GET", "https://example.com/data360/user?userId=003USER02", {
         headers: { "if-none-match": expectedEtag },
       });
       const response = await worker.fetch(request, mockEnv);
@@ -435,10 +436,8 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
         },
       };
 
-      const request = new Request("https://example.com/api/data360/users/003USER03", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: "Updated User", email: "user@example.com" }),
+      const request = await signedRequest(mockEnv, "POST", "https://example.com/api/data360/users/003USER03", {
+        body: { name: "Updated User", email: "user@example.com" },
       });
 
       const response = await worker.fetch(request, mockEnv, mockCtx);
@@ -461,7 +460,7 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
       await d1Cache.putSession("0MwSESSION01", { Id: "0MwSESSION01", Status: "Active" });
 
       // GET
-      const getReq = new Request("https://example.com/api/data360/messagingsessions/0MwSESSION01");
+      const getReq = await signedRequest(mockEnv, "GET", "https://example.com/api/data360/messagingsessions/0MwSESSION01");
       const getRes = await worker.fetch(getReq, mockEnv);
       expect(getRes.status).toBe(200);
       expect(getRes.headers.get("Cache-Tag")).toBe("data360-session,data360-session-0MwSESSION01");
@@ -469,10 +468,8 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
 
       // POST
       const mockCtx = { cache: { purge: vi.fn().mockResolvedValue(true) } };
-      const postReq = new Request("https://example.com/api/data360/messagingsessions/0MwSESSION01", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ Status: "Ended", EndTimeReason: "AgentResolved" }),
+      const postReq = await signedRequest(mockEnv, "POST", "https://example.com/api/data360/messagingsessions/0MwSESSION01", {
+        body: { Status: "Ended", EndTimeReason: "AgentResolved" },
       });
 
       const postRes = await worker.fetch(postReq, mockEnv, mockCtx);
@@ -492,10 +489,8 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
         },
       };
 
-      const purgeReq = new Request("https://example.com/api/data360/cache/purge", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tags: ["data360-user-123", "data360-session-456"] }),
+      const purgeReq = await signedRequest(mockEnv, "POST", "https://example.com/api/data360/cache/purge", {
+        body: { tags: ["data360-user-123", "data360-session-456"] },
       });
 
       const purgeRes = await worker.fetch(purgeReq, mockEnv, mockCtx);
@@ -561,7 +556,7 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
       await d1Cache.putUser("FAST_USER_01", userData, { orgId: "org-1", etag: userEtag });
 
       // Matching ETag on User endpoint -> 304 Not Modified
-      const userReq = new Request("https://example.com/api/data360/users/FAST_USER_01", {
+      const userReq = await signedRequest(mockEnv, "GET", "https://example.com/api/data360/users/FAST_USER_01", {
         headers: { "if-none-match": userEtag },
       });
       const userRes = await worker.fetch(userReq, mockEnv);
@@ -575,7 +570,7 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
       const sessEtag = await computeETag(sessionData);
       await d1Cache.putSession("FAST_SESS_01", sessionData, { orgId: "org-1", etag: sessEtag });
 
-      const sessReq = new Request("https://example.com/api/data360/messagingsessions/FAST_SESS_01", {
+      const sessReq = await signedRequest(mockEnv, "GET", "https://example.com/api/data360/messagingsessions/FAST_SESS_01", {
         headers: { "if-none-match": sessEtag },
       });
       const sessRes = await worker.fetch(sessReq, mockEnv);
@@ -593,7 +588,7 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
 
       // Client has stale/old ETag
       const staleEtag = '"stale-etag-99999"';
-      const req = new Request("https://example.com/api/data360/users/USER_FRESH", {
+      const req = await signedRequest(mockEnv, "GET", "https://example.com/api/data360/users/USER_FRESH", {
         headers: { "if-none-match": staleEtag },
       });
       const res = await worker.fetch(req, mockEnv);
@@ -611,10 +606,8 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
       const mockCtx = { cache: { purge: vi.fn().mockResolvedValue(true) } };
 
       // POST User
-      const postUserReq = new Request("https://example.com/api/data360/users/USER_POST_01", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: "new@example.com", name: "New Name" }),
+      const postUserReq = await signedRequest(mockEnv, "POST", "https://example.com/api/data360/users/USER_POST_01", {
+        body: { email: "new@example.com", name: "New Name" },
       });
       const postUserRes = await worker.fetch(postUserReq, mockEnv, mockCtx);
       expect(postUserRes.status).toBe(200);
@@ -631,10 +624,8 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
       expect(storedUserEtag).toBe(userJson.etag);
 
       // POST Session
-      const postSessReq = new Request("https://example.com/api/data360/messagingsessions/SESS_POST_01", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ Status: "Ended", Channel: "Web" }),
+      const postSessReq = await signedRequest(mockEnv, "POST", "https://example.com/api/data360/messagingsessions/SESS_POST_01", {
+        body: { Status: "Ended", Channel: "Web" },
       });
       const postSessRes = await worker.fetch(postSessReq, mockEnv, mockCtx);
       expect(postSessRes.status).toBe(200);
