@@ -1,0 +1,24 @@
+{
+	"name": "tubot-sf-data360",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev",
+		"test": "bun test",
+		"verify:live": "bash scripts/data-cloud/test.sh",
+		"cf-typegen": "wrangler types",
+		"seed:live": "bash scripts/data-cloud/seed.sh"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-plugin": "^1.0.0",
+		"@types/node": "^26.6.2",
+		"typescript": "^5.5.2",
+		"vitest": "~4.1.0",
+		"wrangler": "^4.139.0"
+	},
+	"dependencies": {
+		"fflate": "^0.8.3"
+	}
+}

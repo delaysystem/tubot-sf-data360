@@ -1,0 +1,78 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tubot-sf-data360",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-09-23",
+  "cache": {
+    "enabled": true
+  },
+  "observability": {
+    "enabled": true,
+    // Billing: automatic invocation logs + traces bill per persisted event
+    // (Oct 2026: ~21M events ≈ $0.72). App console logs still persist.
+    "logs": { "enabled": true, "invocation_logs": false },
+    "traces": { "enabled": false }
+  },
+  "upload_source_maps": true,
+  "vars": {
+    "BACKBLAZE_BUCKET_NAME": "tubot-encrypted",
+    "DATA360_PATH_PREFIX": "data360"
+  },
+  "services": [
+    {
+      "binding": "TUBOT_SF_AUTH",
+      "service": "tubot-sf-auth-staging",
+      "entrypoint": "TubotSfAuthEntrypoint"
+    },
+    {
+      "binding": "TUBOT_SF_PARSER",
+      "service": "tubot-sf-parser"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agent-dashboard-db-staging",
+      "database_id": "8f100c42-cb9a-44aa-b995-391f942edf10"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "DATA360_KV",
+      "id": "bbd0c91c063b4529b99256c1af508d9a"
+    }
+  ],
+  "env": {
+    "production": {
+      "name": "tubot-sf-data360-production",
+      "vars": {
+        "BACKBLAZE_BUCKET_NAME": "tubot-encrypted",
+        "DATA360_PATH_PREFIX": "data360-prod"
+      },
+      "services": [
+        {
+          "binding": "TUBOT_SF_AUTH",
+          "service": "tubot-sf-auth",
+          "entrypoint": "TubotSfAuthEntrypoint"
+        },
+        {
+          "binding": "TUBOT_SF_PARSER",
+          "service": "tubot-sf-parser"
+        }
+      ],
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "agent-dashboard-db-production",
+          "database_id": "0334422a-b534-4322-be11-9e195947b348"
+        }
+      ],
+      "kv_namespaces": [
+        {
+          "binding": "DATA360_KV",
+          "id": "b668578a050d4d60903de4e045adca66"
+        }
+      ]
+    }
+  }
+}
