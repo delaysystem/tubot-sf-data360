@@ -12,11 +12,11 @@
 		"seed:live": "bash scripts/data-cloud/seed.sh"
 	},
 	"devDependencies": {
-		"@cloudflare/vitest-plugin": "^1.0.0",
-		"@types/node": "^26.6.2",
-		"typescript": "^5.5.2",
-		"vitest": "~4.1.0",
-		"wrangler": "^4.139.0"
+		"@cloudflare/vitest-plugin": "^1.8.3",
+		"@types/node": "^26.6.6",
+		"typescript": "^7.0.2",
+		"vitest": "~5.1.0",
+		"wrangler": "^4.163.0"
 	},
 	"dependencies": {
 		"fflate": "^0.8.3"
