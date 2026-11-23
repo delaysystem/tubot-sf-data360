@@ -15,7 +15,7 @@ import type {
 } from "./types";
 import { DATA_CLOUD_FAMILIES } from "./types";
 import { SalesforceAuthBridge, SalesforceAuthorizationError, type ResolvedAuthResult } from "./auth-client";
-import { Data360Extractor } from "./data360-extractor";
+import { Data360Extractor, assertSoqlId } from "./data360-extractor";
 import { B2CacheManager } from "./b2-cache-manager";
 import { claimServiceNonce, readSigHeaders, verifyServiceSignature, verifyRpcEnvelope, type RpcEnvelopeInput, type ServiceSigHeaders } from "./service-verify";
 import { initCache } from "./cache";
@@ -79,7 +79,7 @@ let isGlobalCached = false;
 let globalSource: "d1" | "b2" | "salesforce" = "salesforce";
 
 if (!bypassCache) {
-  const globalHit = await d1Cache.getGlobalData360WithETag(targetGlobalId, options.authedOrgId);
+  const globalHit = await d1Cache.getGlobalData360WithETag(targetGlobalId, resolveCacheReadOrg(options));
   if (globalHit && globalHit.data) {
     globalData = globalHit.data;
     isGlobalCached = true;
@@ -115,7 +115,7 @@ if (!globalData) {
   }
   globalEtag = await computeETag(globalData);
   await d1Cache.putGlobalData360(targetGlobalId, globalData, {
-    orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
+    orgId: resolveCacheOrgId(options, authResult),
     etag: globalEtag,
     ttlSeconds: resolved ? undefined : NEGATIVE_CACHE_TTL_SEC,
   });
@@ -128,7 +128,7 @@ let isUserCached = false;
 let userSource: "d1" | "salesforce" = "salesforce";
 
 if (!bypassCache) {
-  const userHit = await d1Cache.getUserWithETag(userId, options.authedOrgId);
+  const userHit = await d1Cache.getUserWithETag(userId, resolveCacheReadOrg(options));
   if (userHit && userHit.data) {
     userData = userHit.data;
     isUserCached = true;
@@ -151,7 +151,7 @@ if (!userData) {
   }
   userEtag = await computeETag(userData);
   await d1Cache.putUser(userId, userData, {
-    orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
+    orgId: resolveCacheOrgId(options, authResult),
     etag: userEtag,
     ttlSeconds: extracted ? undefined : NEGATIVE_CACHE_TTL_SEC,
   });
@@ -164,7 +164,7 @@ let isConvCached = false;
 let convSource: "d1" | "auth_service" | "salesforce" = "auth_service";
 
 if (!bypassCache) {
-  const convHit = await d1Cache.getConversationHistoryWithETag(userId, options.authedOrgId);
+  const convHit = await d1Cache.getConversationHistoryWithETag(userId, resolveCacheReadOrg(options));
   if (convHit && convHit.data) {
     convData = convHit.data;
     isConvCached = true;
@@ -200,7 +200,7 @@ if (!convData) {
   }
   convEtag = await computeETag(convData);
   await d1Cache.putConversationHistory(userId, convData, {
-    orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
+    orgId: resolveCacheOrgId(options, authResult),
     etag: convEtag,
     ttlSeconds: fetched ? undefined : NEGATIVE_CACHE_TTL_SEC,
   });
@@ -268,6 +268,39 @@ const HTTP_GATE_MAX_BODY = 65536;
  * long enough to shadow real data. Security against cross-tenant poisoning
  * comes from the HTTP gate plus org-bound reads, not from this TTL. */
 const NEGATIVE_CACHE_TTL_SEC = 30;
+
+/**
+ * Resolves the org label for a D1 cache write. Authenticated sources win:
+ * the live Salesforce connection org, then the HTTP-gate-validated org. A
+ * caller-asserted options.orgId is used only when no authenticated org is
+ * available yet (trusted service-mesh/RPC callers, failure-fallback rows).
+ * When both exist and disagree, fail closed with 403 instead of writing a
+ * row that would poison another tenant's org-bound cache reads. Prefix
+ * comparison matches SalesforceAuthBridge.resolveToken (15-char vs 18-char
+ * Salesforce ID forms for the same org).
+ */
+export function resolveCacheOrgId(
+  options: { orgId?: string; authedOrgId?: string },
+  authResult?: { connection?: { orgId?: string } } | null,
+): string | undefined {
+  const authed = authResult?.connection?.orgId || options.authedOrgId;
+  const asserted = options.orgId;
+  if (authed && asserted && asserted.slice(0, 15) !== authed.slice(0, 15)) {
+    throw Object.assign(new Error("data360_org_mismatch"), { status: 403 });
+  }
+  return authed || asserted;
+}
+
+/**
+ * Org scope for a D1 cache read. Authenticated org first; the caller's
+ * asserted scope second so honest service-mesh/RPC tenants sharing an id
+ * cannot read each other's rows. Untrusted HTTP token callers always bind
+ * to their validated org via authedOrgId; unbound reads remain only for
+ * trusted callers that pass no scope at all.
+ */
+export function resolveCacheReadOrg(options: { orgId?: string; authedOrgId?: string }): string | undefined {
+  return options.authedOrgId || options.orgId;
+}
 
 /** HTTP caller auth for data routes: an HMAC service signature (worker mesh)
  * or a live-validated explicit Salesforce token. Scope-only requests (team /
@@ -467,7 +500,7 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
     await requireData360RpcAuth(this.env as Data360Env, "getUserData360", [userId, options], auth);
     const d1Cache = new D1Data360Cache(this.env?.DB);
     if (!options?.bypassCache) {
-      const cached = await d1Cache.getUser(userId);
+      const cached = await d1Cache.getUser(userId, resolveCacheReadOrg(options || {}));
       if (cached) return cached;
     }
 
@@ -479,7 +512,7 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
 
     const computedEtag = await computeETag(userData);
     await d1Cache.putUser(userId, userData, {
-      orgId: options?.orgId || authResult.connection.orgId,
+      orgId: resolveCacheOrgId(options || {}, authResult),
       ttlSeconds: options?.cacheTtlSeconds,
       etag: computedEtag,
     });
@@ -526,7 +559,7 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
     await requireData360RpcAuth(this.env as Data360Env, "getMessagingSessionData360", [sessionId, options], auth);
     const d1Cache = new D1Data360Cache(this.env?.DB);
     if (!options?.bypassCache) {
-      const cached = await d1Cache.getSession(sessionId);
+      const cached = await d1Cache.getSession(sessionId, resolveCacheReadOrg(options || {}));
       if (cached) return cached;
     }
 
@@ -538,7 +571,7 @@ export class TubotSfData360Entrypoint extends BaseWorkerEntrypoint {
 
     const computedEtag = await computeETag(sessionData);
     await d1Cache.putSession(sessionId, sessionData, {
-      orgId: options?.orgId || authResult.connection.orgId,
+      orgId: resolveCacheOrgId(options || {}, authResult),
       ttlSeconds: options?.cacheTtlSeconds,
       etag: computedEtag,
     });
@@ -738,7 +771,7 @@ export async function assembleContext(
     let userSource: "d1" | "salesforce" = "salesforce";
 
     if (!options.bypassCache && !options.bypassUserCache) {
-      const customerHit = await d1Cache.getUserWithETag(userId, options.authedOrgId);
+      const customerHit = await d1Cache.getUserWithETag(userId, resolveCacheReadOrg(options));
       if (customerHit && customerHit.data) {
         customerData = customerHit.data;
         isUserCached = true;
@@ -761,7 +794,7 @@ export async function assembleContext(
       userEtag = await computeETag(customerData);
       await writeD1(
         d1Cache.putUser(userId, customerData, {
-          orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
+          orgId: resolveCacheOrgId(options, authResult),
           etag: userEtag,
           ttlSeconds: extracted ? undefined : NEGATIVE_CACHE_TTL_SEC,
         })
@@ -778,7 +811,7 @@ export async function assembleContext(
     let convSource: "d1" | "auth_service" | "salesforce" = "auth_service";
 
     if (!options.bypassCache && !options.bypassConversationCache) {
-      const convHit = await d1Cache.getConversationHistoryWithETag(userId, options.authedOrgId);
+      const convHit = await d1Cache.getConversationHistoryWithETag(userId, resolveCacheReadOrg(options));
       if (convHit && convHit.data) {
         convData = convHit.data;
         isConvCached = true;
@@ -816,7 +849,7 @@ export async function assembleContext(
       convEtag = await computeETag(convData);
       await writeD1(
         d1Cache.putConversationHistory(userId, convData, {
-          orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
+          orgId: resolveCacheOrgId(options, authResult),
           etag: convEtag,
           ttlSeconds: fetched ? undefined : NEGATIVE_CACHE_TTL_SEC,
         })
@@ -856,7 +889,7 @@ export async function assembleContext(
     let globalSource: "d1" | "b2" | "salesforce" = "salesforce";
 
     if (!options.bypassCache && !options.bypassGlobalCache) {
-      const globalHit = await d1Cache.getGlobalData360WithETag(channelId, options.authedOrgId);
+      const globalHit = await d1Cache.getGlobalData360WithETag(channelId, resolveCacheReadOrg(options));
       if (globalHit && globalHit.data) {
         globalData = globalHit.data;
         isGlobalCached = true;
@@ -892,7 +925,7 @@ export async function assembleContext(
       globalEtag = await computeETag(globalData);
       await writeD1(
         d1Cache.putGlobalData360(channelId, globalData, {
-          orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
+          orgId: resolveCacheOrgId(options, authResult),
           etag: globalEtag,
           ttlSeconds: resolved ? undefined : NEGATIVE_CACHE_TTL_SEC,
         })
@@ -909,7 +942,7 @@ export async function assembleContext(
     let toolUrlsSource: "d1" | "auth_service" | "retrieve64" = "auth_service";
 
     if (!options.bypassCache && !options.bypassToolUrlsCache) {
-      const toolHit = await d1Cache.getToolUrlsWithETag(channelId, options.authedOrgId);
+      const toolHit = await d1Cache.getToolUrlsWithETag(channelId, resolveCacheReadOrg(options));
       if (toolHit && toolHit.data) {
         toolCallUrls = toolHit.data;
         isToolUrlsCached = true;
@@ -943,7 +976,7 @@ export async function assembleContext(
       toolUrlsEtag = await computeETag(toolCallUrls);
       await writeD1(
         d1Cache.putToolUrls(channelId, toolCallUrls, {
-          orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
+          orgId: resolveCacheOrgId(options, authResult),
           etag: toolUrlsEtag,
           ttlSeconds: lookedUp ? undefined : NEGATIVE_CACHE_TTL_SEC,
         })
@@ -960,7 +993,7 @@ export async function assembleContext(
     let agentSource: "d1" | "parser" | "provided" = "parser";
 
     if (!options.bypassCache && !options.bypassAgentCache) {
-      const agentHit = await d1Cache.getAgentCodeWithETag(agentKey, options.authedOrgId);
+      const agentHit = await d1Cache.getAgentCodeWithETag(agentKey, resolveCacheReadOrg(options));
       const agentCandidate = agentHit ? agentHit.data : null;
       if (agentCandidate && Array.isArray(agentCandidate.topics) && agentCandidate.topics.length > 0) {
         precompiledAgent = agentCandidate;
@@ -1055,7 +1088,7 @@ export async function assembleContext(
       const callerProvided = !!(options.agentScript || options.agentXml);
       await writeD1(
         d1Cache.putAgentCode(agentKey, precompiledAgent, {
-          orgId: options.authedOrgId || options.orgId || authResult?.connection?.orgId,
+          orgId: resolveCacheOrgId(options, authResult),
           etag: agentEtag,
           ttlSeconds: agentSource === "parser" || callerProvided ? undefined : NEGATIVE_CACHE_TTL_SEC,
         })
@@ -1660,6 +1693,14 @@ export default {
             { status: 400 }
           );
         }
+        try {
+          assertSoqlId(targetUserId, "userId");
+        } catch {
+          return Response.json(
+            { error: "invalid_request", message: "userId parameter is malformed." },
+            { status: 400 }
+          );
+        }
 
         const canonicalUrl = normalizeCanonicalUrl(request.url);
         const edgeKeyUrl = new URL(canonicalUrl);
@@ -1734,7 +1775,7 @@ export default {
             // 4. Store in D1 cache
             const computedEtag = await computeETag(userData);
             await d1Cache.putUser(targetUserId, userData, {
-              orgId: httpOrg || options.orgId || authResult.connection.orgId,
+              orgId: resolveCacheOrgId({ orgId: options.orgId, authedOrgId: httpOrg }, authResult),
               etag: computedEtag,
             });
           } catch (err: unknown) {
@@ -1870,6 +1911,14 @@ export default {
             { status: 400 }
           );
         }
+        try {
+          assertSoqlId(targetSessionId, "sessionId");
+        } catch {
+          return Response.json(
+            { error: "invalid_request", message: "sessionId parameter is malformed." },
+            { status: 400 }
+          );
+        }
 
         const canonicalUrl = normalizeCanonicalUrl(request.url);
         const edgeKeyUrl = new URL(canonicalUrl);
@@ -1944,7 +1993,7 @@ export default {
             // 4. Store in D1 cache
             const computedEtag = await computeETag(sessionData);
             await d1Cache.putSession(targetSessionId, sessionData, {
-              orgId: httpOrg || options.orgId || authResult.connection.orgId,
+              orgId: resolveCacheOrgId({ orgId: options.orgId, authedOrgId: httpOrg }, authResult),
               etag: computedEtag,
             });
           } catch (err: unknown) {

@@ -1,9 +1,23 @@
-import { zipSync, strToU8 } from "fflate";
+import { zipSync, strToU8, type Zippable } from "fflate";
 import type {
   ExportData360Options,
   ExtractedData360Package,
   ExtractedUnstructuredFile,
 } from "./types";
+
+/**
+ * DEFLATE level for JSON/text ZIP entries (origin: fflate level docs — level
+ * 1 compresses text ~10x faster than the old level 6 at a small ratio cost,
+ * which is the right trade on the request hot path).
+ */
+export const ZIP_TEXT_COMPRESSION_LEVEL = 1;
+
+/**
+ * DEFLATE level for binary ZIP entries (origin: STORE — PDF/PNG/JPEG/DOCX
+ * payloads are already compressed, so DEFLATE burns event-loop CPU for ~0
+ * bytes saved; storing them uncompressed removes that cost entirely).
+ */
+export const ZIP_BINARY_COMPRESSION_LEVEL = 0;
 
 export class ZipBuilder {
   /**
@@ -12,17 +26,17 @@ export class ZipBuilder {
    * are excluded from the zip payload.
    */
   static buildZip(pkg: ExtractedData360Package, options?: ExportData360Options): Uint8Array {
-    const files: Record<string, Uint8Array> = {};
+    const files: Zippable = {};
 
     function addJson(path: string, obj: unknown) {
       if (obj === undefined) return;
       const jsonStr = JSON.stringify(obj, null, 2);
-      files[path] = strToU8(jsonStr);
+      files[path] = [strToU8(jsonStr), { level: ZIP_TEXT_COMPRESSION_LEVEL }];
     }
 
     function addText(path: string, text: string | undefined) {
       if (!text) return;
-      files[path] = strToU8(text);
+      files[path] = [strToU8(text), { level: ZIP_TEXT_COMPRESSION_LEVEL }];
     }
 
     // 1. Manifest
@@ -129,7 +143,11 @@ export class ZipBuilder {
 
         const pathInZip = `data/files/${categoryDir}/${file.filename}`;
         if (file.data) {
-          files[pathInZip] = file.data instanceof Uint8Array ? file.data : new Uint8Array(file.data);
+          const bytes = file.data instanceof Uint8Array ? file.data : new Uint8Array(file.data);
+          // Text payloads still compress well; every other category ships
+          // pre-compressed bytes that DEFLATE cannot shrink further.
+          const level = file.category === "text" ? ZIP_TEXT_COMPRESSION_LEVEL : ZIP_BINARY_COMPRESSION_LEVEL;
+          files[pathInZip] = [bytes, { level }];
         }
 
         return {
@@ -150,7 +168,8 @@ export class ZipBuilder {
       addJson("metadata/files-manifest.json", fileManifest);
     }
 
-    // Compress in-memory to standard ZIP
-    return zipSync(files, { level: 6 });
+    // Per-entry levels above carry the compression policy (fast level for
+    // text/JSON, STORE for binaries); no global default is applied here.
+    return zipSync(files);
   }
 }

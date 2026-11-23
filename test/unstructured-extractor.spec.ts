@@ -492,10 +492,10 @@ describe("UnstructuredExtractor", () => {
         "SELECT Id, Title, FileType, FileExtension, ContentSize, ContentDocumentId, Description FROM ContentVersion WHERE IsLatest = true ORDER BY CreatedDate DESC LIMIT 50"
       );
       expect(UNSTRUCTURED_LISTING_QUERIES.document).toBe(
-        "SELECT Id, Name, Type, ContentType, BodyLength, Description FROM Document ORDER BY CreatedDate DESC"
+        "SELECT Id, Name, Type, ContentType, BodyLength, Description FROM Document ORDER BY CreatedDate DESC LIMIT 50"
       );
       expect(UNSTRUCTURED_LISTING_QUERIES.staticResource).toBe(
-        "SELECT Id, Name, ContentType, BodyLength, Description FROM StaticResource ORDER BY CreatedDate DESC"
+        "SELECT Id, Name, ContentType, BodyLength, Description FROM StaticResource ORDER BY CreatedDate DESC LIMIT 50"
       );
     });
   });

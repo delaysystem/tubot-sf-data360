@@ -21,6 +21,47 @@ import type { UnstructuredFileListings } from "./unstructured-extractor";
 import { B2CacheManager } from "./b2-cache-manager";
 import { getAgentScripts, getCallableToolUrlsForChannel, RetrievePendingError } from "../../tubot-sf-auth/src/agent-script";
 
+/**
+ * Allowlist for values interpolated into SOQL string literals. Salesforce
+ * record IDs are 15/18-char alphanumerics (origin: Salesforce ID format);
+ * caller-supplied user/session keys may also carry `-`/`_` (external keys,
+ * MessagingEndUser keys). Quote, backslash, whitespace, and every other
+ * SOQL metacharacter (parens, comma, semicolon, equals, asterisk) are
+ * rejected, so a value passing this test cannot break out of its quoted
+ * literal; `-`/`_` are inert inside a string literal.
+ */
+const SOQL_ID_ALLOWLIST = /^[A-Za-z0-9][A-Za-z0-9_-]{0,17}$/;
+
+/** MessagingChannel record IDs carry the 0Mj key prefix (origin: Salesforce key-prefix table). */
+const MESSAGING_CHANNEL_ID_PATTERN = /^0Mj[A-Za-z0-9]{12,15}$/;
+
+/**
+ * Validates a caller-supplied ID for SOQL interpolation. Throws on empty,
+ * overlong, or metacharacter-bearing input instead of querying.
+ */
+export function assertSoqlId(value: string, label: string): string {
+  const clean = (value ?? "").trim();
+  if (!SOQL_ID_ALLOWLIST.test(clean)) {
+    throw new Error(`Invalid ${label}: expected a Salesforce record ID or external key (1-18 chars, letters/digits/_/-).`);
+  }
+  return clean;
+}
+
+/**
+ * Escapes a value for a SOQL single-quoted string literal (origin: SOQL
+ * docs — backslash is the escape character). Defense-in-depth alongside
+ * assertSoqlId: allowlisted IDs contain no quotable chars, but every
+ * interpolation site escapes anyway so a future caller cannot forget.
+ */
+export function escapeSoqlString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+/** Record-sourced IDs (linked rows) are validated, never trusted blindly. */
+function isSafeSoqlId(value: unknown): value is string {
+  return typeof value === "string" && SOQL_ID_ALLOWLIST.test(value.trim());
+}
+
 export class Data360Extractor {
   constructor(
     private readonly batchClient = new SalesforceBatchClient(),
@@ -219,7 +260,10 @@ export class Data360Extractor {
 
     const crmSubrequests: BatchSubrequest[] = [];
     if (options.includeCrmRecords !== false) {
-      const channelIdFilter = channelRecord?.Id || (options.channelId && options.channelId.startsWith("0Mj") ? options.channelId : "");
+      // MessagingSession channel filter: only a well-formed channel record ID
+      // is interpolated; anything else falls back to the unfiltered query.
+      const channelIdCandidate = channelRecord?.Id || (options.channelId && options.channelId.startsWith("0Mj") ? options.channelId : "");
+      const channelIdFilter = MESSAGING_CHANNEL_ID_PATTERN.test(channelIdCandidate || "") ? channelIdCandidate : "";
       crmSubrequests.push(
         // 0: Individual
         {
@@ -261,7 +305,7 @@ export class Data360Extractor {
           method: "GET",
           url: `${apiVersion}/query?q=${encodeURIComponent(
             channelIdFilter
-              ? `SELECT Id, ChannelName, ChannelType, Status, CreatedDate FROM MessagingSession WHERE MessagingChannelId = '${channelIdFilter}' LIMIT 200`
+              ? `SELECT Id, ChannelName, ChannelType, Status, CreatedDate FROM MessagingSession WHERE MessagingChannelId = '${escapeSoqlString(channelIdFilter)}' LIMIT 200`
               : `SELECT Id, ChannelName, ChannelType, Status, CreatedDate FROM MessagingSession ORDER BY CreatedDate DESC LIMIT 100`
           )}`,
         },
@@ -516,20 +560,21 @@ export class Data360Extractor {
     options?: { apiVersion?: string; orgId?: string }
   ): Promise<UserData360Result> {
     const apiVersion = options?.apiVersion || SalesforceBatchClient.DEFAULT_API_VERSION;
-    const cleanUserId = userId.trim();
+    const cleanUserId = assertSoqlId(userId, "userId");
+    const safeUserId = escapeSoqlString(cleanUserId);
 
     // 1. Batch query CRM records: Individual, Contact, Lead, ContactPointEmail, ContactPointPhone
     const crmQueries = [
       // 0: Individual
-      `SELECT Id, FirstName, LastName, Salutation, CreatedDate FROM Individual WHERE Id = '${cleanUserId}'`,
+      `SELECT Id, FirstName, LastName, Salutation, CreatedDate FROM Individual WHERE Id = '${safeUserId}'`,
       // 1: Contact
-      `SELECT Id, FirstName, LastName, Email, Phone, AccountId, IndividualId, CreatedDate FROM Contact WHERE Id = '${cleanUserId}' OR IndividualId = '${cleanUserId}'`,
+      `SELECT Id, FirstName, LastName, Email, Phone, AccountId, IndividualId, CreatedDate FROM Contact WHERE Id = '${safeUserId}' OR IndividualId = '${safeUserId}'`,
       // 2: Lead
-      `SELECT Id, FirstName, LastName, Company, Email, Phone, Status, IndividualId, CreatedDate FROM Lead WHERE Id = '${cleanUserId}' OR IndividualId = '${cleanUserId}'`,
+      `SELECT Id, FirstName, LastName, Company, Email, Phone, Status, IndividualId, CreatedDate FROM Lead WHERE Id = '${safeUserId}' OR IndividualId = '${safeUserId}'`,
       // 3: ContactPointEmail
-      `SELECT Id, ParentId, EmailAddress, IsPrimary, CreatedDate FROM ContactPointEmail WHERE ParentId = '${cleanUserId}' OR Id = '${cleanUserId}'`,
+      `SELECT Id, ParentId, EmailAddress, IsPrimary, CreatedDate FROM ContactPointEmail WHERE ParentId = '${safeUserId}' OR Id = '${safeUserId}'`,
       // 4: ContactPointPhone
-      `SELECT Id, ParentId, TelephoneNumber, FormattedInternationalPhoneNumber, IsPrimary, CreatedDate FROM ContactPointPhone WHERE ParentId = '${cleanUserId}' OR Id = '${cleanUserId}'`,
+      `SELECT Id, ParentId, TelephoneNumber, FormattedInternationalPhoneNumber, IsPrimary, CreatedDate FROM ContactPointPhone WHERE ParentId = '${safeUserId}' OR Id = '${safeUserId}'`,
     ];
 
     const queryResults = await this.batchClient.batchQueries(conn, crmQueries, apiVersion);
@@ -540,14 +585,17 @@ export class Data360Extractor {
     let contactPointEmails = queryResults[3]?.records || [];
     let contactPointPhones = queryResults[4]?.records || [];
 
-    // If individual was not directly matched by Id, but Contact/Lead has an IndividualId, look that up
+    // If individual was not directly matched by Id, but Contact/Lead has an IndividualId, look that up.
+    // The linked ID comes from org data, not the caller, but is still
+    // allowlisted: a malformed value skips the follow-up rather than interpolating.
     const linkedIndividualId = contact?.IndividualId || lead?.IndividualId;
-    if (!individual && linkedIndividualId && linkedIndividualId !== cleanUserId) {
+    if (!individual && isSafeSoqlId(linkedIndividualId) && linkedIndividualId.trim() !== cleanUserId) {
       try {
+        const safeLinkedId = escapeSoqlString(linkedIndividualId.trim());
         const indQueries = [
-          `SELECT Id, FirstName, LastName, Salutation, CreatedDate FROM Individual WHERE Id = '${linkedIndividualId}'`,
-          `SELECT Id, ParentId, EmailAddress, IsPrimary, CreatedDate FROM ContactPointEmail WHERE ParentId = '${linkedIndividualId}'`,
-          `SELECT Id, ParentId, TelephoneNumber, FormattedInternationalPhoneNumber, IsPrimary, CreatedDate FROM ContactPointPhone WHERE ParentId = '${linkedIndividualId}'`,
+          `SELECT Id, FirstName, LastName, Salutation, CreatedDate FROM Individual WHERE Id = '${safeLinkedId}'`,
+          `SELECT Id, ParentId, EmailAddress, IsPrimary, CreatedDate FROM ContactPointEmail WHERE ParentId = '${safeLinkedId}'`,
+          `SELECT Id, ParentId, TelephoneNumber, FormattedInternationalPhoneNumber, IsPrimary, CreatedDate FROM ContactPointPhone WHERE ParentId = '${safeLinkedId}'`,
         ];
         const indResults = await this.batchClient.batchQueries(conn, indQueries, apiVersion);
         if (indResults[0]?.records?.[0]) {
@@ -576,7 +624,7 @@ export class Data360Extractor {
             Accept: "application/json",
           },
           body: JSON.stringify({
-            sql: `SELECT * FROM ${dmo} WHERE ssot__Id__c = '${cleanUserId}' OR Id__c = '${cleanUserId}' LIMIT 10`,
+            sql: `SELECT * FROM ${dmo} WHERE ssot__Id__c = '${safeUserId}' OR Id__c = '${safeUserId}' LIMIT 10`,
           }),
         });
 
@@ -611,12 +659,13 @@ export class Data360Extractor {
     options?: { apiVersion?: string; orgId?: string }
   ): Promise<MessagingSessionData360Result> {
     const apiVersion = options?.apiVersion || SalesforceBatchClient.DEFAULT_API_VERSION;
-    const cleanSessionId = sessionId.trim();
+    const cleanSessionId = assertSoqlId(sessionId, "sessionId");
+    const safeSessionId = escapeSoqlString(cleanSessionId);
 
     // 1. Query MessagingSession and ConversationEntry (transcripts)
     const queries = [
-      `SELECT Id, ChannelName, ChannelType, Status, StartTime, EndTime, EndTimeReason, MessagingEndUserId, ContactId, LeadId, CaseId FROM MessagingSession WHERE Id = '${cleanSessionId}'`,
-      `SELECT Id, ConversationId, EntryType, MessageText, ActorType, ActorName, ClientTimestamp, CreatedDate FROM ConversationEntry WHERE ConversationId = '${cleanSessionId}' ORDER BY CreatedDate ASC`,
+      `SELECT Id, ChannelName, ChannelType, Status, StartTime, EndTime, EndTimeReason, MessagingEndUserId, ContactId, LeadId, CaseId FROM MessagingSession WHERE Id = '${safeSessionId}'`,
+      `SELECT Id, ConversationId, EntryType, MessageText, ActorType, ActorName, ClientTimestamp, CreatedDate FROM ConversationEntry WHERE ConversationId = '${safeSessionId}' ORDER BY CreatedDate ASC`,
     ];
 
     const results = await this.batchClient.batchQueries(conn, queries, apiVersion);
@@ -627,12 +676,13 @@ export class Data360Extractor {
     // 2. Link Customer 360 data
     let customer360: UserData360Result | null = null;
     if (session) {
-      // Check if MessagingEndUser can resolve ContactId or LeadId if missing
-      if (!session.ContactId && !session.LeadId && session.MessagingEndUserId) {
+      // Check if MessagingEndUser can resolve ContactId or LeadId if missing.
+      // Record-sourced: validated before interpolation, skipped when malformed.
+      if (!session.ContactId && !session.LeadId && isSafeSoqlId(session.MessagingEndUserId)) {
         try {
           const meuRecords = await this.batchClient.querySingle(
             conn,
-            `SELECT Id, Name, ContactId, LeadId, MessageType FROM MessagingEndUser WHERE Id = '${session.MessagingEndUserId}'`,
+            `SELECT Id, Name, ContactId, LeadId, MessageType FROM MessagingEndUser WHERE Id = '${escapeSoqlString(session.MessagingEndUserId.trim())}'`,
             apiVersion
           );
           if (meuRecords[0]?.ContactId) session.ContactId = meuRecords[0].ContactId;

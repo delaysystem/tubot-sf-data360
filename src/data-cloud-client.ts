@@ -20,6 +20,24 @@ export class DataCloudBudgetExhaustedError extends Error {
 export const DATA_CLOUD_RETRIEVE_SUBREQUEST_BUDGET = 16;
 
 /**
+ * QueryV2 async-poll deadline (origin: prior fixed 60s inline deadline; one
+ * awaited poll loop must fit well inside the Worker's wall-clock budget).
+ */
+export const DATA_CLOUD_QUERY_DEADLINE_MS = 60_000;
+
+/**
+ * Initial QueryV2 poll delay (origin: prior fixed 500ms cadence, now the
+ * exponential-backoff base so healthy queries keep their old latency).
+ */
+export const DATA_CLOUD_QUERY_POLL_BASE_MS = 500;
+
+/**
+ * Maximum QueryV2 poll delay (origin: 10x the base — bounds backoff growth
+ * while keeping worst-case poll count inside the subrequest budget).
+ */
+export const DATA_CLOUD_QUERY_POLL_MAX_MS = 5_000;
+
+/**
  * Catalog metadata keys retained after discovery. Per-object `fields` arrays
  * and every other key are dropped: full metadata is megabytes and is
  * re-serialized on every export, while the worker only reads these keys
@@ -213,11 +231,24 @@ export class DataCloudClient {
     let result = await this.request(`query-sql?dataspace=${encodeURIComponent(dataSpace)}`, "POST", { sql });
     let status = result.status ?? {};
     const queryId = status.queryId ?? result.queryId;
-    const deadline = Date.now() + 60_000;
+    const deadline = Date.now() + DATA_CLOUD_QUERY_DEADLINE_MS;
+    // Async polls retry transient failures (5xx/429/network) with
+    // exponential backoff + jitter inside the deadline; a single failed
+    // poll GET no longer aborts the whole query. Auth/permission failures
+    // (401/403/404) rethrow immediately — retrying them is pointless.
+    let pollAttempt = 0;
     while (queryId && status.completionStatus !== "ResultsProduced" && !Array.isArray(result.data) && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      const polled = await this.request(`query-sql/${encodeURIComponent(queryId)}?dataspace=${encodeURIComponent(dataSpace)}`);
-      status = polled.status ?? polled;
+      const backoff = Math.min(DATA_CLOUD_QUERY_POLL_MAX_MS, DATA_CLOUD_QUERY_POLL_BASE_MS * 2 ** pollAttempt);
+      await new Promise(resolve => setTimeout(resolve, backoff / 2 + Math.random() * (backoff / 2)));
+      if (Date.now() >= deadline) break;
+      try {
+        const polled = await this.request(`query-sql/${encodeURIComponent(queryId)}?dataspace=${encodeURIComponent(dataSpace)}`);
+        status = polled.status ?? polled;
+        pollAttempt = 0;
+      } catch (error) {
+        if (/HTTP (401|403|404)\b/.test(String(error))) throw error;
+        pollAttempt++;
+      }
     }
     if (status.completionStatus === "ResultsProduced" && status.rowCount === 0) return [];
     if (!Array.isArray(result.data) && status.completionStatus !== "ResultsProduced") throw new Error("Data 360 SQL did not complete within its query deadline");
@@ -229,7 +260,10 @@ export class DataCloudClient {
       if (!result.metadata) result = { ...result, metadata: page.metadata };
     }
     const columns = result.metadata?.columns ?? result.metadata ?? [];
-    const names = Array.isArray(columns) ? columns.map((c: Row) => c.name ?? c.columnName) : Object.keys(columns).sort((a,b) => (columns[a].placeInOrder ?? 0) - (columns[b].placeInOrder ?? 0));
+    // Object-form metadata sorts by placeInOrder with a name tiebreak: ties
+    // previously fell back to upstream JSON key order, which varies between
+    // identical responses and misaligned array rows across calls.
+    const names = Array.isArray(columns) ? columns.map((c: Row) => c.name ?? c.columnName) : Object.keys(columns).sort((a,b) => (columns[a].placeInOrder ?? 0) - (columns[b].placeInOrder ?? 0) || (a < b ? -1 : a > b ? 1 : 0));
     return data.slice(0, rowLimit).map((row: unknown) => {
       if (Array.isArray(row)) return Object.fromEntries(row.map((value, i) => [names[i] ?? String(i), value]));
       if (row && typeof row === "object") return row as Row;

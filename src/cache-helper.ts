@@ -228,6 +228,15 @@ const fallbackBucket: MemoryCacheBucket = {
   toolUrls: new Map(),
 };
 
+/**
+ * Expiry-sweep deletions must be observable: a failed DELETE leaves the
+ * stale row in D1, and every later read re-serves it. Log the failure with
+ * its scope so staleness is visible instead of silent.
+ */
+function logInvalidationFailure(scope: string, key: string, err: unknown): void {
+  console.warn(`data360 cache invalidation failed [${scope}]:`, key, err instanceof Error ? err.message : String(err));
+}
+
 export function getCacheBucket(db?: D1Database): MemoryCacheBucket {
   if (!db || typeof db !== "object") return fallbackBucket;
   let bucket = dbCacheStore.get(db);
@@ -408,6 +417,7 @@ export class D1Data360Cache {
     parse: (raw: string) => T,
     payloadCol = "data",
     expectedOrg?: string,
+    scope = "cache",
   ): Promise<CacheRead<T> | null> {
     const now = Date.now();
     const mem = bucket.get(D1Data360Cache.memKey(key, expectedOrg));
@@ -425,7 +435,16 @@ export class D1Data360Cache {
 
       if (!row) return null;
       if (row.expires_at > 0 && row.expires_at < now) {
-        await deleter(key).catch(() => {});
+        // Deleters report D1 failures as `false` instead of throwing, so the
+        // boolean — not just a rejection — is the staleness signal to observe.
+        try {
+          const swept = await deleter(key);
+          if (swept === false) {
+            logInvalidationFailure(scope, key, new Error("DELETE removed no row; the stale entry may persist"));
+          }
+        } catch (err) {
+          logInvalidationFailure(scope, key, err);
+        }
         return null;
       }
       const parsed = parse(row[payloadCol]);
@@ -441,7 +460,7 @@ export class D1Data360Cache {
       "SELECT data, etag, expires_at FROM data360_user_cache WHERE user_id = ?",
       (key) => this.deleteUser(key),
       (raw) => { try { return JSON.parse(raw); } catch { return raw; } },
-      "data", expectedOrg);
+      "data", expectedOrg, "user");
   }
 
   async getSessionWithETag(sessionId: string, expectedOrg?: string): Promise<CacheRead<any> | null> {
@@ -449,7 +468,7 @@ export class D1Data360Cache {
       "SELECT data, etag, expires_at FROM data360_session_cache WHERE session_id = ?",
       (key) => this.deleteSession(key),
       (raw) => { try { return JSON.parse(raw); } catch { return raw; } },
-      "data", expectedOrg);
+      "data", expectedOrg, "session");
   }
 
   async getConversationHistoryWithETag(userId: string, expectedOrg?: string): Promise<CacheRead<any> | null> {
@@ -457,7 +476,7 @@ export class D1Data360Cache {
       "SELECT data, etag, expires_at FROM data360_conversation_cache WHERE user_id = ?",
       (key) => this.deleteConversationHistory(key),
       (raw) => { try { return JSON.parse(raw); } catch { return raw; } },
-      "data", expectedOrg);
+      "data", expectedOrg, "conversation");
   }
 
   async getGlobalData360WithETag(targetId: string, expectedOrg?: string): Promise<CacheRead<any> | null> {
@@ -465,7 +484,7 @@ export class D1Data360Cache {
       "SELECT data, etag, expires_at FROM data360_global_cache WHERE target_id = ?",
       (key) => this.deleteGlobalData360(key),
       (raw) => { try { return JSON.parse(raw); } catch { return raw; } },
-      "data", expectedOrg);
+      "data", expectedOrg, "global");
   }
 
   async getAgentCodeWithETag(agentKey: string, expectedOrg?: string): Promise<CacheRead<any> | null> {
@@ -473,7 +492,7 @@ export class D1Data360Cache {
       "SELECT data, etag, expires_at FROM data360_agent_code_cache WHERE agent_key = ?",
       (key) => this.deleteAgentCode(key),
       (raw) => { try { return JSON.parse(raw); } catch { return raw; } },
-      "data", expectedOrg);
+      "data", expectedOrg, "agent-code");
   }
 
   async getToolUrlsWithETag(channelId: string, expectedOrg?: string): Promise<CacheRead<string[]> | null> {
@@ -481,7 +500,7 @@ export class D1Data360Cache {
       "SELECT urls, etag, expires_at FROM data360_tool_urls_cache WHERE channel_id = ?",
       (key) => this.deleteToolUrls(key),
       (raw) => { try { const parsed = JSON.parse(raw); return Array.isArray(parsed) ? parsed : []; } catch { return []; } },
-      "urls", expectedOrg);
+      "urls", expectedOrg, "tool-urls");
   }
 
   async getUserETag(userId: string, expectedOrg?: string): Promise<string | null> {
@@ -503,7 +522,12 @@ export class D1Data360Cache {
 
       if (!row || !row.etag) return null;
       if (row.expires_at > 0 && row.expires_at < now) {
-        await this.deleteUser(userId).catch(() => {});
+        try {
+          const swept = await this.deleteUser(userId);
+          if (!swept) logInvalidationFailure("user", userId, new Error("DELETE removed no row; the stale entry may persist"));
+        } catch (err) {
+          logInvalidationFailure("user", userId, err);
+        }
         return null;
       }
       return row.etag;
@@ -591,7 +615,12 @@ export class D1Data360Cache {
 
       if (!row || !row.etag) return null;
       if (row.expires_at > 0 && row.expires_at < now) {
-        await this.deleteSession(sessionId).catch(() => {});
+        try {
+          const swept = await this.deleteSession(sessionId);
+          if (!swept) logInvalidationFailure("session", sessionId, new Error("DELETE removed no row; the stale entry may persist"));
+        } catch (err) {
+          logInvalidationFailure("session", sessionId, err);
+        }
         return null;
       }
       return row.etag;
@@ -679,7 +708,12 @@ export class D1Data360Cache {
 
       if (!row || !row.etag) return null;
       if (row.expires_at > 0 && row.expires_at < now) {
-        await this.deleteConversationHistory(userId).catch(() => {});
+        try {
+          const swept = await this.deleteConversationHistory(userId);
+          if (!swept) logInvalidationFailure("conversation", userId, new Error("DELETE removed no row; the stale entry may persist"));
+        } catch (err) {
+          logInvalidationFailure("conversation", userId, err);
+        }
         return null;
       }
       return row.etag;
@@ -777,7 +811,12 @@ export class D1Data360Cache {
 
       if (!row || !row.etag) return null;
       if (row.expires_at > 0 && row.expires_at < now) {
-        await this.deleteGlobalData360(targetId).catch(() => {});
+        try {
+          const swept = await this.deleteGlobalData360(targetId);
+          if (!swept) logInvalidationFailure("global", targetId, new Error("DELETE removed no row; the stale entry may persist"));
+        } catch (err) {
+          logInvalidationFailure("global", targetId, err);
+        }
         return null;
       }
       return row.etag;
@@ -865,7 +904,12 @@ export class D1Data360Cache {
 
       if (!row || !row.etag) return null;
       if (row.expires_at > 0 && row.expires_at < now) {
-        await this.deleteAgentCode(agentKey).catch(() => {});
+        try {
+          const swept = await this.deleteAgentCode(agentKey);
+          if (!swept) logInvalidationFailure("agent-code", agentKey, new Error("DELETE removed no row; the stale entry may persist"));
+        } catch (err) {
+          logInvalidationFailure("agent-code", agentKey, err);
+        }
         return null;
       }
       return row.etag;
@@ -954,7 +998,12 @@ export class D1Data360Cache {
 
       if (!row || !row.etag) return null;
       if (row.expires_at > 0 && row.expires_at < now) {
-        await this.deleteToolUrls(channelId).catch(() => {});
+        try {
+          const swept = await this.deleteToolUrls(channelId);
+          if (!swept) logInvalidationFailure("tool-urls", channelId, new Error("DELETE removed no row; the stale entry may persist"));
+        } catch (err) {
+          logInvalidationFailure("tool-urls", channelId, err);
+        }
         return null;
       }
       return row.etag;

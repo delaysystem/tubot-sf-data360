@@ -3,18 +3,40 @@ import type { ExtractedUnstructuredFile, SalesforceConnection } from "./types";
 export type FileCategory = ExtractedUnstructuredFile["category"];
 
 /**
+ * Discovery listing cap per object (origin: the ContentVersion precedent of
+ * 50 already in this file — one composite-batch slice stays small and one
+ * query page covers the whole listing, so runSoql never needs nextRecordsUrl).
+ */
+export const UNSTRUCTURED_LISTING_LIMIT = 50;
+
+/**
  * Discovery SOQL used to list unstructured-file candidates. Exported so the
  * Data 360 extractor can run them inside its shared composite batch instead
- * of this extractor issuing standalone queries.
+ * of this extractor issuing standalone queries. Every listing carries a
+ * LIMIT so an org with thousands of Documents cannot blow the batch slice.
  */
 export const UNSTRUCTURED_LISTING_QUERIES = {
   contentVersion:
-    "SELECT Id, Title, FileType, FileExtension, ContentSize, ContentDocumentId, Description FROM ContentVersion WHERE IsLatest = true ORDER BY CreatedDate DESC LIMIT 50",
+    `SELECT Id, Title, FileType, FileExtension, ContentSize, ContentDocumentId, Description FROM ContentVersion WHERE IsLatest = true ORDER BY CreatedDate DESC LIMIT ${UNSTRUCTURED_LISTING_LIMIT}`,
   document:
-    "SELECT Id, Name, Type, ContentType, BodyLength, Description FROM Document ORDER BY CreatedDate DESC",
+    `SELECT Id, Name, Type, ContentType, BodyLength, Description FROM Document ORDER BY CreatedDate DESC LIMIT ${UNSTRUCTURED_LISTING_LIMIT}`,
   staticResource:
-    "SELECT Id, Name, ContentType, BodyLength, Description FROM StaticResource ORDER BY CreatedDate DESC",
+    `SELECT Id, Name, ContentType, BodyLength, Description FROM StaticResource ORDER BY CreatedDate DESC LIMIT ${UNSTRUCTURED_LISTING_LIMIT}`,
 };
+
+/**
+ * Max single-file binary download (origin: Workers 128 MiB isolate memory —
+ * one file must stay a small fraction since the ZIP holds every file plus
+ * JSON; a larger asset is skipped with a warning, not fetched).
+ */
+export const UNSTRUCTURED_MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Max total binaries per extraction (origin: same 128 MiB isolate budget —
+ * caps the whole unstructured payload below half the isolate even before
+ * ZIP assembly; files past the budget are skipped with a warning).
+ */
+export const UNSTRUCTURED_MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 
 export interface UnstructuredFileListings {
   contentVersion?: any[];
@@ -331,7 +353,10 @@ export class UnstructuredExtractor {
       }
 
       const json = (await res.json()) as { records?: T[] };
-      return Array.isArray(json?.records) ? json.records : [];
+      // Listings are LIMIT-bounded, so the first page is the whole result;
+      // slice defensively so a limit-less caller query cannot flood memory.
+      const records = Array.isArray(json?.records) ? json.records : [];
+      return records.slice(0, UNSTRUCTURED_LISTING_LIMIT);
     };
 
     // 1. ContentVersion (Prioritizes PDF files first in memory)
@@ -457,11 +482,22 @@ export class UnstructuredExtractor {
       }
     }
 
-    // Download binaries using concurrency pool (default 5 concurrent fetches)
-    const extractedFiles = await runWithConcurrency(
+    // Download binaries using concurrency pool (default 5 concurrent fetches).
+    // Oversize assets are skipped with a warning (null) instead of fetched:
+    // one giant file must not OOM the isolate or evict every other file.
+    let totalBytes = 0;
+    const downloaded = await runWithConcurrency(
       recordsToDownload,
       concurrency,
-      async (rec): Promise<ExtractedUnstructuredFile> => {
+      async (rec): Promise<ExtractedUnstructuredFile | null> => {
+        if (rec.contentSize > UNSTRUCTURED_MAX_FILE_BYTES) {
+          console.warn(`Skipping oversize ${rec.sourceObject} ${rec.id}: declared ${rec.contentSize} bytes exceeds the ${UNSTRUCTURED_MAX_FILE_BYTES}-byte per-file cap.`);
+          return null;
+        }
+        if (totalBytes >= UNSTRUCTURED_MAX_TOTAL_BYTES) {
+          console.warn(`Skipping ${rec.sourceObject} ${rec.id}: extraction already reached the ${UNSTRUCTURED_MAX_TOTAL_BYTES}-byte total binary budget.`);
+          return null;
+        }
         const res = await this.fetch(rec.downloadUrl, {
           method: "GET",
           headers: {
@@ -480,7 +516,23 @@ export class UnstructuredExtractor {
           );
         }
 
+        const declaredLength = Number(res.headers.get("content-length"));
+        if (Number.isFinite(declaredLength) && declaredLength > UNSTRUCTURED_MAX_FILE_BYTES) {
+          console.warn(`Skipping oversize ${rec.sourceObject} ${rec.id}: Content-Length ${declaredLength} bytes exceeds the ${UNSTRUCTURED_MAX_FILE_BYTES}-byte per-file cap.`);
+          return null;
+        }
+
         const buffer = await res.arrayBuffer();
+        if (buffer.byteLength > UNSTRUCTURED_MAX_FILE_BYTES) {
+          console.warn(`Skipping oversize ${rec.sourceObject} ${rec.id}: downloaded ${buffer.byteLength} bytes exceeds the ${UNSTRUCTURED_MAX_FILE_BYTES}-byte per-file cap.`);
+          return null;
+        }
+        totalBytes += buffer.byteLength;
+        if (totalBytes > UNSTRUCTURED_MAX_TOTAL_BYTES) {
+          totalBytes -= buffer.byteLength;
+          console.warn(`Skipping ${rec.sourceObject} ${rec.id}: keeping it would exceed the ${UNSTRUCTURED_MAX_TOTAL_BYTES}-byte total binary budget.`);
+          return null;
+        }
         const data = new Uint8Array(buffer);
 
         // Inspect response Content-Type header if record didn't supply one
@@ -542,6 +594,6 @@ export class UnstructuredExtractor {
       }
     );
 
-    return extractedFiles;
+    return downloaded.filter((f): f is ExtractedUnstructuredFile => f !== null);
   }
 }
