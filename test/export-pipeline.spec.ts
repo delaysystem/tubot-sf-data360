@@ -421,6 +421,7 @@ describe("tubot-sf-data360 export pipeline", () => {
     });
 
     const env: Data360Env = {
+      DB: createGateMockD1(),
       DATA360_INTERNAL_KEY: "test-internal-secret-0123456789abcdef",
       BACKBLAZE_KEY_ID: "test-key-id",
       BACKBLAZE_APPLICATION_KEY: "test-app-key",
@@ -437,14 +438,12 @@ describe("tubot-sf-data360 export pipeline", () => {
       },
     };
 
-    const req = new Request("https://data360.internal/cache/refresh", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-data360-secret": "test-internal-secret-0123456789abcdef" },
-      body: JSON.stringify({
+    const req = await signedRequest(env, "POST", "https://data360.internal/cache/refresh", {
+      body: {
         agentName: "DATA360TEST",
         teamId: "team-1",
         orgId: "00D000000000001AAA",
-      }),
+      },
     });
 
     const res = await worker.fetch(req, env);

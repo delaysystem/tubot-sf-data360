@@ -522,10 +522,40 @@ export class UnstructuredExtractor {
           return null;
         }
 
-        const buffer = await res.arrayBuffer();
-        if (buffer.byteLength > UNSTRUCTURED_MAX_FILE_BYTES) {
-          console.warn(`Skipping oversize ${rec.sourceObject} ${rec.id}: downloaded ${buffer.byteLength} bytes exceeds the ${UNSTRUCTURED_MAX_FILE_BYTES}-byte per-file cap.`);
-          return null;
+        let buffer: ArrayBuffer;
+        if (res.body && typeof res.body.getReader === "function") {
+          const reader = res.body.getReader();
+          const chunks: Uint8Array[] = [];
+          let received = 0;
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (!value) continue;
+              received += value.byteLength;
+              if (received > UNSTRUCTURED_MAX_FILE_BYTES) {
+                try { await reader.cancel(); } catch {}
+                console.warn(`Skipping oversize ${rec.sourceObject} ${rec.id}: streamed >${UNSTRUCTURED_MAX_FILE_BYTES} bytes exceeds the per-file cap.`);
+                return null;
+              }
+              chunks.push(value);
+            }
+          } finally {
+            try { reader.releaseLock(); } catch {}
+          }
+          const combined = new Uint8Array(received);
+          let offset = 0;
+          for (const c of chunks) {
+            combined.set(c, offset);
+            offset += c.byteLength;
+          }
+          buffer = combined.buffer;
+        } else {
+          buffer = await res.arrayBuffer();
+          if (buffer.byteLength > UNSTRUCTURED_MAX_FILE_BYTES) {
+            console.warn(`Skipping oversize ${rec.sourceObject} ${rec.id}: downloaded ${buffer.byteLength} bytes exceeds the ${UNSTRUCTURED_MAX_FILE_BYTES}-byte per-file cap.`);
+            return null;
+          }
         }
         totalBytes += buffer.byteLength;
         if (totalBytes > UNSTRUCTURED_MAX_TOTAL_BYTES) {

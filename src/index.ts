@@ -1044,22 +1044,23 @@ export async function assembleContext(
         }
       }
 
-      // 3) HTTP Fetch to parser URL
+      // 3) HTTP Fetch to parser URL (explicitly configured via PARSER_SERVICE_URL)
       if (!precompiledAgent) {
-        const parserUrl =
-          env.PARSER_SERVICE_URL || "https://tubot-sf-parser.emalteaproductions.workers.dev/api/v1/parse";
-        try {
-          const parseResp = await fetch(parserUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ content: scriptOrXml }),
-          });
-          if (parseResp.ok) {
-            precompiledAgent = await parseResp.json();
-            agentSource = "parser";
+        const parserUrl = env.PARSER_SERVICE_URL;
+        if (parserUrl) {
+          try {
+            const parseResp = await fetch(parserUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ content: scriptOrXml }),
+            });
+            if (parseResp.ok) {
+              precompiledAgent = await parseResp.json();
+              agentSource = "parser";
+            }
+          } catch {
+            // Fall through
           }
-        } catch {
-          // Fall through
         }
       }
 
@@ -2187,25 +2188,19 @@ export default {
         }
         const nowSec = Math.floor(Date.now() / 1000);
         const sig = readSigHeaders(request.headers);
-        if (sig) {
-          // Signed requests require replay protection; without a D1 binding
-          // there is no nonce store, so fail closed instead of skipping it.
-          if (!env.DB) {
-            return Response.json({ error: "data360_unconfigured" }, { status: 503 });
-          }
-          const ok =
-            (await verifyServiceSignature(keys, request.method, path, refreshRawBody, sig, nowSec)) &&
-            (await claimServiceNonce(env.DB, sig.nonce, nowSec));
-          if (!ok) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
-        } else {
-          const providedSecret = request.headers.get("x-data360-secret");
-          const legacyOk =
-            !!providedSecret && keys.some((k) => timingSafeEqual(providedSecret, k));
-          if (!legacyOk) {
-            return Response.json({ error: "unauthorized" }, { status: 401 });
-          }
+        if (!sig) {
+          return Response.json({ error: "unauthorized" }, { status: 401 });
+        }
+        // Signed requests require replay protection; without a D1 binding
+        // there is no nonce store, so fail closed instead of skipping it.
+        if (!env.DB) {
+          return Response.json({ error: "data360_unconfigured" }, { status: 503 });
+        }
+        const ok =
+          (await verifyServiceSignature(keys, request.method, path, refreshRawBody, sig, nowSec)) &&
+          (await claimServiceNonce(env.DB, sig.nonce, nowSec));
+        if (!ok) {
+          return Response.json({ error: "unauthorized" }, { status: 401 });
         }
       }
 
@@ -2237,7 +2232,12 @@ export default {
         if (channelIdParam && !options.channelId) options.channelId = channelIdParam;
         if (agentNameParam && !options.agentName) options.agentName = agentNameParam;
         if (formatParam && !options.format) options.format = formatParam as "zip" | "json";
-        if (maxRecordsParam && !options.maxRecords) options.maxRecords = parseInt(maxRecordsParam, 10);
+        if (maxRecordsParam && !options.maxRecords) {
+          const parsedMaxRecords = parseInt(maxRecordsParam, 10);
+          if (Number.isFinite(parsedMaxRecords)) {
+            options.maxRecords = Math.min(2000, Math.max(1, parsedMaxRecords));
+          }
+        }
         if (cacheToB2Param !== null && options.cacheToB2 === undefined) {
           options.cacheToB2 = cacheToB2Param === "true" || cacheToB2Param === "1";
         }
@@ -2508,12 +2508,19 @@ export default {
         }
 
         if (file && data instanceof Uint8Array) {
+          const rawName = (file.split("/").pop() || "download").replace(/[^a-zA-Z0-9._-]/g, "_");
+          const detectedType = getContentTypeForFile(file);
+          const safeContentType =
+            detectedType.toLowerCase().includes("svg") || detectedType.toLowerCase().includes("html")
+              ? "application/octet-stream"
+              : detectedType;
           return new Response(data, {
             status: 200,
             headers: {
-              "Content-Type": getContentTypeForFile(file),
+              "Content-Type": safeContentType,
+              "X-Content-Type-Options": "nosniff",
               "X-Bz-Info-Bandwidth-Alliance": "true",
-              "Content-Disposition": `inline; filename="${file.split("/").pop()}"`,
+              "Content-Disposition": `attachment; filename="${rawName}"`,
             },
           });
         }

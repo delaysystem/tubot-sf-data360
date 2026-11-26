@@ -3,6 +3,8 @@
   "name": "tubot-sf-data360",
   "main": "src/worker.ts",
   "compatibility_date": "2026-09-23",
+  "workers_dev": false,
+  "preview_urls": false,
   "cache": {
     "enabled": true
   },
@@ -10,7 +12,7 @@
     "enabled": true,
     // Billing: automatic invocation logs + traces bill per persisted event
     // (Oct 2026: ~21M events ≈ $0.72). App console logs still persist.
-    "logs": { "enabled": true, "invocation_logs": false },
+    "logs": { "enabled": true, "invocation_logs": false, "head_sampling_rate": 0.1 },
     "traces": { "enabled": false }
   },
   "upload_source_maps": true,
@@ -45,6 +47,8 @@
   "env": {
     "production": {
       "name": "tubot-sf-data360-production",
+      "workers_dev": false,
+      "preview_urls": false,
       "vars": {
         "BACKBLAZE_BUCKET_NAME": "tubot-encrypted",
         "DATA360_PATH_PREFIX": "data360-prod"

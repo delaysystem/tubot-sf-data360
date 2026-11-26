@@ -42,27 +42,30 @@ describe("POST /cache/refresh internal gate", () => {
     vi.restoreAllMocks();
   });
 
-  it("returns 401 {error:\"unauthorized\"} when the secret header is missing", async () => {
-    const res = await worker.fetch(refreshRequest("/cache/refresh"), baseEnv());
+  it("returns 401 {error:\"unauthorized\"} when HMAC headers are missing", async () => {
+    const res = await worker.fetch(refreshRequest("/cache/refresh"), baseEnv({ DB: createGateMockD1() }));
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "unauthorized" });
   });
 
-  it("returns 401 {error:\"unauthorized\"} when the secret is wrong", async () => {
-    const res = await worker.fetch(refreshRequest("/cache/refresh", "wrong-secret"), baseEnv());
+  it("returns 401 {error:\"unauthorized\"} when the secret/signature is wrong", async () => {
+    const res = await worker.fetch(refreshRequest("/cache/refresh", "wrong-secret"), baseEnv({ DB: createGateMockD1() }));
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "unauthorized" });
   });
 
-  it("returns 401 on the /api/cache/refresh alias without a valid secret", async () => {
-    const res = await worker.fetch(refreshRequest("/api/cache/refresh", "wrong-secret"), baseEnv());
+  it("returns 401 on the /api/cache/refresh alias without valid HMAC auth", async () => {
+    const res = await worker.fetch(refreshRequest("/api/cache/refresh", "wrong-secret"), baseEnv({ DB: createGateMockD1() }));
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "unauthorized" });
   });
 
   it("returns 503 {error:\"data360_unconfigured\"} when the server secret is unset", async () => {
-    const env = baseEnv({ DATA360_INTERNAL_KEY: undefined });
-    const res = await worker.fetch(refreshRequest("/cache/refresh", SECRET), env);
+    const env = baseEnv({ DATA360_INTERNAL_KEY: undefined, DB: createGateMockD1() });
+    const req = await signedRequest(baseEnv(), "POST", "https://data360.internal/cache/refresh", {
+      body: { channelId: "0Mj000000000001AAA", teamId: "team-1", orgId: "00D000000000001AAA" },
+    });
+    const res = await worker.fetch(req, env);
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ error: "data360_unconfigured" });
   });
@@ -73,16 +76,14 @@ describe("POST /cache/refresh internal gate", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     });
-    const res = await worker.fetch(req, baseEnv());
+    const res = await worker.fetch(req, baseEnv({ DB: createGateMockD1() }));
     expect(res.status).toBe(401);
   });
 
   it("returns 405 {error:\"method_not_allowed\"} for GET on /cache/refresh", async () => {
-    const req = new Request("https://data360.internal/cache/refresh", {
-      method: "GET",
-      headers: { "x-data360-secret": SECRET },
-    });
-    const res = await worker.fetch(req, baseEnv());
+    const env = baseEnv({ DB: createGateMockD1() });
+    const req = await signedRequest(env, "GET", "https://data360.internal/cache/refresh");
+    const res = await worker.fetch(req, env);
     expect(res.status).toBe(405);
     expect(await res.json()).toEqual({ error: "method_not_allowed" });
   });
@@ -144,10 +145,14 @@ describe("POST /cache/refresh recency short-circuit", () => {
 
     const getTokenForChannel = vi.fn();
     const env = baseEnv({
+      DB: createGateMockD1(),
       TUBOT_SF_AUTH: { getTokenForChannel },
     });
 
-    const res = await worker.fetch(refreshRequest("/api/cache/refresh", SECRET), env);
+    const req = await signedRequest(env, "POST", "https://data360.internal/api/cache/refresh", {
+      body: { channelId: "0Mj000000000001AAA", teamId: "team-1", orgId: "00D000000000001AAA" },
+    });
+    const res = await worker.fetch(req, env);
     expect(res.status).toBe(200);
     const data = (await res.json()) as any;
     expect(data.ok).toBe(true);
@@ -203,9 +208,12 @@ describe("POST /cache/refresh recency short-circuit", () => {
       orgId: "00D000000000001AAA",
       teamId: "team-1",
     });
-    const env = baseEnv({ TUBOT_SF_AUTH: { getTokenForChannel } });
+    const env = baseEnv({ DB: createGateMockD1(), TUBOT_SF_AUTH: { getTokenForChannel } });
 
-    const res = await worker.fetch(refreshRequest("/cache/refresh", SECRET), env);
+    const req = await signedRequest(env, "POST", "https://data360.internal/cache/refresh", {
+      body: { channelId: "0Mj000000000001AAA", teamId: "team-1", orgId: "00D000000000001AAA" },
+    });
+    const res = await worker.fetch(req, env);
     const data = (await res.json()) as any;
     expect(data.deduped).toBeUndefined();
     expect(getTokenForChannel).toHaveBeenCalled();
@@ -248,9 +256,12 @@ describe("POST /cache/refresh recency short-circuit", () => {
       orgId: "00D000000000001AAA",
       teamId: "team-1",
     });
-    const env = baseEnv({ TUBOT_SF_AUTH: { getTokenForChannel } });
+    const env = baseEnv({ DB: createGateMockD1(), TUBOT_SF_AUTH: { getTokenForChannel } });
 
-    const res = await worker.fetch(refreshRequest("/cache/refresh", SECRET), env);
+    const req = await signedRequest(env, "POST", "https://data360.internal/cache/refresh", {
+      body: { channelId: "0Mj000000000001AAA", teamId: "team-1", orgId: "00D000000000001AAA" },
+    });
+    const res = await worker.fetch(req, env);
     const data = (await res.json()) as any;
     expect(data.deduped).toBeUndefined();
     expect(getTokenForChannel).toHaveBeenCalled();
@@ -293,9 +304,12 @@ describe("POST /cache/refresh recency short-circuit", () => {
       orgId: "00D000000000001AAA",
       teamId: "team-1",
     });
-    const env = baseEnv({ TUBOT_SF_AUTH: { getTokenForChannel } });
+    const env = baseEnv({ DB: createGateMockD1(), TUBOT_SF_AUTH: { getTokenForChannel } });
 
-    const res = await worker.fetch(refreshRequest("/cache/refresh", SECRET), env);
+    const req = await signedRequest(env, "POST", "https://data360.internal/cache/refresh", {
+      body: { channelId: "0Mj000000000001AAA", teamId: "team-1", orgId: "00D000000000001AAA" },
+    });
+    const res = await worker.fetch(req, env);
     const data = (await res.json()) as any;
     expect(res.status).toBe(200);
     expect(data.ok).toBe(true);

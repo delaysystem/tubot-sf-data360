@@ -1023,17 +1023,35 @@ export class B2CacheManager {
       entry.totalBytes += size;
     }
 
+    const candidateEntries = Array.from(snapshotMap.entries()).filter(([snapshotId, entry]) =>
+      entry.files.some((file) => file.fileName === `${prefix}${snapshotId}/manifest.json`)
+    );
+    const MANIFEST_FETCH_CONCURRENCY = 6;
+    const manifests: Array<{
+      snapshotId: string;
+      entry: { files: Array<{ fileName: string; contentLength?: number }>; totalBytes: number };
+      manifest: ExportManifest | null;
+    }> = [];
+    for (let i = 0; i < candidateEntries.length; i += MANIFEST_FETCH_CONCURRENCY) {
+      const chunk = candidateEntries.slice(i, i + MANIFEST_FETCH_CONCURRENCY);
+      const loaded = await Promise.all(
+        chunk.map(async ([snapshotId, entry]) => {
+          const manifestKey = `${prefix}${snapshotId}/manifest.json`;
+          const manifestBytes = await this.doDownload(manifestKey);
+          let manifest: ExportManifest | null = null;
+          if (manifestBytes) {
+            const text = new TextDecoder().decode(manifestBytes);
+            manifest = JSON.parse(text);
+          }
+          return { snapshotId, entry, manifest };
+        })
+      );
+      manifests.push(...loaded);
+    }
+
     const summaries: B2SnapshotSummary[] = [];
 
-    for (const [snapshotId, entry] of snapshotMap.entries()) {
-      if (!entry.files.some(file => file.fileName === `${prefix}${snapshotId}/manifest.json`)) continue;
-      let manifest: ExportManifest | null = null;
-      const manifestKey = `${prefix}${snapshotId}/manifest.json`;
-      const manifestBytes = await this.doDownload(manifestKey);
-      if (manifestBytes) {
-        const text = new TextDecoder().decode(manifestBytes);
-        manifest = JSON.parse(text);
-      }
+    for (const { snapshotId, entry, manifest } of manifests) {
       if (!manifest) continue;
 
       const zipFile = entry.files.find((f) => f.fileName.endsWith("data360-export.zip"));
@@ -1061,6 +1079,9 @@ export class B2CacheManager {
    * Saves individual user Data 360 data to B2 storage.
    */
   async saveUserData(orgId: string, userId: string, data: any): Promise<string> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(orgId)) {
+      throw new Error("Invalid orgId");
+    }
     const cleanUserId = userId.replace(/[^a-zA-Z0-9_-]/g, "_");
     const filePath = `${this.rootPrefix()}/${orgId}/users/${cleanUserId}/data360.json`;
     const jsonStr = typeof data === "string" ? data : JSON.stringify(data, null, 2);
@@ -1072,6 +1093,9 @@ export class B2CacheManager {
    * Saves individual messaging session Data 360 data to B2 storage.
    */
   async saveSessionData(orgId: string, sessionId: string, data: any): Promise<string> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(orgId)) {
+      throw new Error("Invalid orgId");
+    }
     const cleanSessionId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
     const filePath = `${this.rootPrefix()}/${orgId}/sessions/${cleanSessionId}/data360.json`;
     const jsonStr = typeof data === "string" ? data : JSON.stringify(data, null, 2);

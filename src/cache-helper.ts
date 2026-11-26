@@ -5,7 +5,7 @@
  */
 import { ensureNonceSchema } from "./service-verify";
 
-export const DEFAULT_CACHE_CONTROL = "public, max-age=0, must-revalidate, s-maxage=300";
+export const DEFAULT_CACHE_CONTROL = "private, no-store";
 
 export const CACHE_BUSTING_PARAMS = [
   "t",
@@ -284,6 +284,19 @@ export function clearAllMemoryCaches(db?: D1Database): void {
  */
 export class D1Data360Cache {
   private static schemasInitialized = new WeakSet<object>();
+  private static readonly MAX_BUCKET_ENTRIES = 500;
+
+  private static setBounded<T>(
+    bucket: Map<string, MemoryCacheEntry<T>>,
+    key: string,
+    value: MemoryCacheEntry<T>,
+  ): void {
+    if (!bucket.has(key) && bucket.size >= D1Data360Cache.MAX_BUCKET_ENTRIES) {
+      const oldestKey = bucket.keys().next().value;
+      if (oldestKey !== undefined) bucket.delete(oldestKey);
+    }
+    bucket.set(key, value);
+  }
 
   constructor(private readonly db?: D1Database) {}
 
@@ -448,7 +461,7 @@ export class D1Data360Cache {
         return null;
       }
       const parsed = parse(row[payloadCol]);
-      bucket.set(D1Data360Cache.memKey(key, expectedOrg), { data: parsed, etag: row.etag || "", expiresAt: row.expires_at });
+      D1Data360Cache.setBounded(bucket, D1Data360Cache.memKey(key, expectedOrg), { data: parsed, etag: row.etag || "", expiresAt: row.expires_at });
       return { data: parsed, etag: row.etag || null };
     } catch {
       return null;
@@ -560,8 +573,8 @@ export class D1Data360Cache {
     }
 
     D1Data360Cache.purgeId(this.bucket.user, userId);
-    this.bucket.user.set(userId, { data: parsed, etag, expiresAt });
-    if (orgId) this.bucket.user.set(D1Data360Cache.memKey(userId, orgId), { data: parsed, etag, expiresAt });
+    D1Data360Cache.setBounded(this.bucket.user, userId, { data: parsed, etag, expiresAt });
+    if (orgId) D1Data360Cache.setBounded(this.bucket.user, D1Data360Cache.memKey(userId, orgId), { data: parsed, etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -653,8 +666,8 @@ export class D1Data360Cache {
     }
 
     D1Data360Cache.purgeId(this.bucket.session, sessionId);
-    this.bucket.session.set(sessionId, { data: parsed, etag, expiresAt });
-    if (orgId) this.bucket.session.set(D1Data360Cache.memKey(sessionId, orgId), { data: parsed, etag, expiresAt });
+    D1Data360Cache.setBounded(this.bucket.session, sessionId, { data: parsed, etag, expiresAt });
+    if (orgId) D1Data360Cache.setBounded(this.bucket.session, D1Data360Cache.memKey(sessionId, orgId), { data: parsed, etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -754,8 +767,8 @@ export class D1Data360Cache {
     }
 
     D1Data360Cache.purgeId(this.bucket.conv, userId);
-    this.bucket.conv.set(userId, { data: parsed, etag, expiresAt });
-    if (orgId) this.bucket.conv.set(D1Data360Cache.memKey(userId, orgId), { data: parsed, etag, expiresAt });
+    D1Data360Cache.setBounded(this.bucket.conv, userId, { data: parsed, etag, expiresAt });
+    if (orgId) D1Data360Cache.setBounded(this.bucket.conv, D1Data360Cache.memKey(userId, orgId), { data: parsed, etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -849,8 +862,8 @@ export class D1Data360Cache {
     }
 
     D1Data360Cache.purgeId(this.bucket.global, targetId);
-    this.bucket.global.set(targetId, { data: parsed, etag, expiresAt });
-    if (orgId) this.bucket.global.set(D1Data360Cache.memKey(targetId, orgId), { data: parsed, etag, expiresAt });
+    D1Data360Cache.setBounded(this.bucket.global, targetId, { data: parsed, etag, expiresAt });
+    if (orgId) D1Data360Cache.setBounded(this.bucket.global, D1Data360Cache.memKey(targetId, orgId), { data: parsed, etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -943,8 +956,8 @@ export class D1Data360Cache {
     }
 
     D1Data360Cache.purgeId(this.bucket.agent, agentKey);
-    this.bucket.agent.set(agentKey, { data: parsed, etag, expiresAt });
-    if (orgId) this.bucket.agent.set(D1Data360Cache.memKey(agentKey, orgId), { data: parsed, etag, expiresAt });
+    D1Data360Cache.setBounded(this.bucket.agent, agentKey, { data: parsed, etag, expiresAt });
+    if (orgId) D1Data360Cache.setBounded(this.bucket.agent, D1Data360Cache.memKey(agentKey, orgId), { data: parsed, etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();
@@ -1031,8 +1044,8 @@ export class D1Data360Cache {
     const etag = options?.etag || (await computeETag(urlsStr));
 
     D1Data360Cache.purgeId(this.bucket.toolUrls, channelId);
-    this.bucket.toolUrls.set(channelId, { data: urls || [], etag, expiresAt });
-    if (orgId) this.bucket.toolUrls.set(D1Data360Cache.memKey(channelId, orgId), { data: urls || [], etag, expiresAt });
+    D1Data360Cache.setBounded(this.bucket.toolUrls, channelId, { data: urls || [], etag, expiresAt });
+    if (orgId) D1Data360Cache.setBounded(this.bucket.toolUrls, D1Data360Cache.memKey(channelId, orgId), { data: urls || [], etag, expiresAt });
 
     if (!this.db) return;
     await this.ensureSchema();

@@ -156,7 +156,7 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
         etag: '"test-etag-123"',
       });
 
-      expect(headers["Cache-Control"]).toBe("public, max-age=0, must-revalidate, s-maxage=300");
+      expect(headers["Cache-Control"]).toBe("private, no-store");
       expect(headers["Cache-Control"]).toBe(DEFAULT_CACHE_CONTROL);
       expect(headers["Cache-Control"]).not.toContain("stale-while-revalidate");
       expect(headers["Cache-Tag"]).toBe("data360-user,data360-user-003XX");
@@ -164,11 +164,11 @@ describe("Cloudflare Declarative Workers Cache & Data360 System", () => {
       expect(headers["Vary"]).toBeUndefined();
     });
 
-    it("verifies DEFAULT_CACHE_CONTROL enforces 0-cost, 0-stale cache hits and eliminates stale-while-revalidate", () => {
-      expect(DEFAULT_CACHE_CONTROL).toBe("public, max-age=0, must-revalidate, s-maxage=300");
+    it("verifies DEFAULT_CACHE_CONTROL enforces private no-store caching and eliminates stale-while-revalidate", () => {
+      expect(DEFAULT_CACHE_CONTROL).toBe("private, no-store");
       expect(DEFAULT_CACHE_CONTROL).not.toContain("stale-while-revalidate");
       const defaultHeaders = buildDeclarativeCacheHeaders();
-      expect(defaultHeaders["Cache-Control"]).toBe("public, max-age=0, must-revalidate, s-maxage=300");
+      expect(defaultHeaders["Cache-Control"]).toBe("private, no-store");
       expect(defaultHeaders["Cache-Control"]).not.toContain("stale-while-revalidate");
     });
 
