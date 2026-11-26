@@ -740,14 +740,22 @@ export async function assembleContext(
   const b2CacheManager = createB2CacheManager(env);
 
   let authResult: any = options.resolvedAuth ?? null;
+  let authPromise: Promise<any> | null = null;
   const getAuth = async () => {
-    if (!authResult) {
-      authResult = await authBridge.resolveToken({
+    if (authResult) return authResult;
+    if (!authPromise) {
+      authPromise = authBridge.resolveToken({
         ...options,
         channelId,
+      }).then((resolved) => {
+        authResult = resolved;
+        return resolved;
+      }).catch((err) => {
+        authPromise = null;
+        throw err;
       });
     }
-    return authResult;
+    return authPromise;
   };
 
   // Zero Trust: When explicit token credentials are provided, validate authorization before reading cache
@@ -900,11 +908,11 @@ export async function assembleContext(
 
     if (!globalData) {
       const snapshotOrg = options.authedOrgId || options.orgId;
-      const b2Snapshot = snapshotOrg
+      const b2Snapshot = snapshotOrg && !options.bypassCache
         ? await b2CacheManager.getLatestSnapshot(snapshotOrg, channelId).catch(() => null)
         : null;
       let resolved = false;
-      if (b2Snapshot && !options.bypassCache) {
+      if (b2Snapshot) {
         globalData = b2Snapshot;
         globalSource = "b2";
         resolved = true;

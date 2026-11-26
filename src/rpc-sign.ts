@@ -63,14 +63,34 @@ export function assertOrgId(org: unknown): string {
   return org;
 }
 
+const RPC_SIGN_ENCODER = new TextEncoder();
+const RPC_SIGN_SALT = RPC_SIGN_ENCODER.encode("tubot-rpc-org-v1");
+const ORG_HMAC_KEY_CACHE = new Map<string, { masterKey: string; cryptoKey: CryptoKey }>();
+const MAX_ORG_HMAC_KEYS = 128;
+
 /** Per-org HMAC key: HKDF-SHA256(masterKey, "tubot-rpc-org-v1", caller + "\n" + orgId). */
 export async function deriveOrgKey(masterKey: string, caller: string, orgId: string): Promise<Uint8Array> {
-  const ikm = await crypto.subtle.importKey("raw", new TextEncoder().encode(masterKey), "HKDF", false, ["deriveBits"]);
+  const ikm = await crypto.subtle.importKey("raw", RPC_SIGN_ENCODER.encode(masterKey), "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("tubot-rpc-org-v1"),
-      info: new TextEncoder().encode(caller + "\n" + orgId) },
+    { name: "HKDF", hash: "SHA-256", salt: RPC_SIGN_SALT,
+      info: RPC_SIGN_ENCODER.encode(caller + "\n" + orgId) },
     ikm, 256);
   return new Uint8Array(bits);
+}
+
+async function cachedOrgCryptoKey(masterKey: string, caller: string, orgId: string): Promise<CryptoKey> {
+  const cacheKey = `${caller}\n${orgId}`;
+  const hit = ORG_HMAC_KEY_CACHE.get(cacheKey);
+  if (hit && hit.masterKey === masterKey) return hit.cryptoKey;
+  const orgKey = await deriveOrgKey(masterKey, caller, orgId);
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw", orgKey, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  if (ORG_HMAC_KEY_CACHE.size >= MAX_ORG_HMAC_KEYS) {
+    const oldest = ORG_HMAC_KEY_CACHE.keys().next().value;
+    if (oldest !== undefined) ORG_HMAC_KEY_CACHE.delete(oldest);
+  }
+  ORG_HMAC_KEY_CACHE.set(cacheKey, { masterKey, cryptoKey });
+  return cryptoKey;
 }
 
 export async function signRpcEnvelope(args: {
@@ -90,9 +110,7 @@ export async function signRpcEnvelope(args: {
   const nonce = args.nonce ?? randomNonce();
   const argsDigest = await sha256Hex(stableJson(args.businessArgs));
   const canonical = args.caller + "\n" + args.org + "\n" + args.method + "\n" + timestamp + "\n" + nonce + "\n" + argsDigest;
-  const orgKey = await deriveOrgKey(args.callerKey, args.caller, args.org);
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw", orgKey, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const sig = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(canonical));
+  const cryptoKey = await cachedOrgCryptoKey(args.callerKey, args.caller, args.org);
+  const sig = await crypto.subtle.sign("HMAC", cryptoKey, RPC_SIGN_ENCODER.encode(canonical));
   return { caller: args.caller, org: args.org, timestamp, nonce, signature: base64UrlEncode(new Uint8Array(sig)) };
 }

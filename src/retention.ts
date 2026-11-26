@@ -137,14 +137,18 @@ export async function purgeRetention(db: RetentionDb, nowMs: number = Date.now()
   const total: Data360RetentionCounts = { user: 0, session: 0, conversation: 0, global: 0, agentCode: 0, toolUrls: 0 };
   let batches = 0;
   let capped = false;
+  let activeTables = [...CACHE_TABLES];
   for (;;) {
     batches++;
     let round = 0;
-    for (const def of CACHE_TABLES) {
+    const nextActive: typeof CACHE_TABLES = [];
+    for (const def of activeTables) {
       const n = await changes(db, purgeSql(def), cutoff);
       total[def.key] += n;
       round += n;
+      if (n > 0) nextActive.push(def);
     }
+    activeTables = nextActive;
     if (round === 0) break;
     if (batches >= RETENTION_MAX_BATCHES) {
       capped = true;

@@ -518,6 +518,7 @@ export class UnstructuredExtractor {
 
         const declaredLength = Number(res.headers.get("content-length"));
         if (Number.isFinite(declaredLength) && declaredLength > UNSTRUCTURED_MAX_FILE_BYTES) {
+          try { await res.body?.cancel(); } catch {}
           console.warn(`Skipping oversize ${rec.sourceObject} ${rec.id}: Content-Length ${declaredLength} bytes exceeds the ${UNSTRUCTURED_MAX_FILE_BYTES}-byte per-file cap.`);
           return null;
         }
