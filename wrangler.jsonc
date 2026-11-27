@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "tubot-sf-data360",
+  "account_id": "3b27bbae23636a0e40eff144e12d7317",
   "main": "src/worker.ts",
   "compatibility_date": "2026-09-23",
   "workers_dev": false,
@@ -25,23 +26,19 @@
       "binding": "TUBOT_SF_AUTH",
       "service": "tubot-sf-auth-staging",
       "entrypoint": "TubotSfAuthEntrypoint"
-    },
-    {
-      "binding": "TUBOT_SF_PARSER",
-      "service": "tubot-sf-parser"
     }
   ],
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "agent-dashboard-db-staging",
-      "database_id": "8f100c42-cb9a-44aa-b995-391f942edf10"
+      "database_id": "572e8088-0bf1-415d-b907-a9fbc62b63ed"
     }
   ],
   "kv_namespaces": [
     {
       "binding": "DATA360_KV",
-      "id": "bbd0c91c063b4529b99256c1af508d9a"
+      "id": "2713c7702b724b9db0ae0785b5dcff10"
     }
   ],
   "env": {
@@ -58,23 +55,19 @@
           "binding": "TUBOT_SF_AUTH",
           "service": "tubot-sf-auth",
           "entrypoint": "TubotSfAuthEntrypoint"
-        },
-        {
-          "binding": "TUBOT_SF_PARSER",
-          "service": "tubot-sf-parser"
         }
       ],
       "d1_databases": [
         {
           "binding": "DB",
           "database_name": "agent-dashboard-db-production",
-          "database_id": "0334422a-b534-4322-be11-9e195947b348"
+          "database_id": "9ffc87cf-dcd6-4e34-8537-49ca46fdbe96"
         }
       ],
       "kv_namespaces": [
         {
           "binding": "DATA360_KV",
-          "id": "b668578a050d4d60903de4e045adca66"
+          "id": "e18cc852884944f1906b7169c75a54f8"
         }
       ]
     }
